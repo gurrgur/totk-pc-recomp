@@ -71,6 +71,7 @@ from pathlib import Path
 import check_isa
 import romfs_index
 from build_shaders import stale as stale_shaders
+from build_ffx_shaders import stale as stale_ffx_shaders
 from check_content import GENERATED_MARKER
 
 WIN = os.name == 'nt'
@@ -320,7 +321,11 @@ def runtime_sources(skip=()):
     names in skip, so a task adds a file without editing this script."""
     pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
             'third_party/imgui/backends/*.cpp')
-    return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip and not other_os(p.name))
+    sdk = RUNTIME / 'third_party/ffx/sdk/src'
+    ffx = [sdk / p for p in ('backends/vk/ffx_vk.cpp', 'components/fsr3upscaler/ffx_fsr3upscaler.cpp',
+                            'shared/ffx_assert.cpp', 'shared/ffx_breadcrumbs_list.cpp',
+                            'shared/ffx_message.cpp', 'shared/ffx_object_management.cpp')]
+    return sorted([p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip and not other_os(p.name)] + ffx)
 
 
 def install_stamp(out, runtime_lib):
@@ -396,7 +401,10 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     inc = f'-I {cmd_path(RUNTIME)} -I {cmd_path(gen)}'
     vma = f'{cmd_path(DEPS / "include")} -I {cmd_path(DEPS / "include" / "vma")}' if DEPS else cmd_path(vma_include())
     imgui = cmd_path(RUNTIME / 'third_party' / 'imgui')
-    rt_inc = f'{inc} -I {cmd_path(out)} -I {vma} -I {imgui}'   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
+    ffx = RUNTIME / 'third_party/ffx/sdk'
+    rt_inc = (f'{inc} -I {cmd_path(out)} -I {vma} -I {imgui} '
+              f'-I {cmd_path(ffx / "include")} -I {cmd_path(ffx / "src/backends/shared")} '
+              f'-I {cmd_path(ffx / "src/shared")}')   # romfs_config.h, vk_mem_alloc.h (+ deps headers), imgui.h
     libs = [f'-L {cmd_path(DEPS / "lib")}'] + (LLVM_LINK_LIBS if WIN else LINK_LIBS) if DEPS else LINK_LIBS
     # A compiler cache (sccache) may front clang: every lift rewrites the generated chunks with the same contents, so
     # the cached objects save the compile step on the next build.
@@ -463,6 +471,9 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         else:
             stamp_dep = (' | ' if not pgo_dep else ' ') + ninja_path(stamp) if stamp else ''
             lines.append(f'build {ninja_path(o)}: cc_rt {ninja_path(src)}{pgo_dep}{stamp_dep}')
+            if src.is_relative_to(RUNTIME / 'third_party/ffx/sdk') or src.name in {'ffx_blobs.cpp', 'ffx_probe.cpp', 'vk_fsr3_backend.cpp'}:
+                lines.append(f'  rtflags = $rtflags -std=c++17 -DFFX_GCC -DFFX_FSR3UPSCALER '
+                             f'-include {cmd_path(RUNTIME / "ffx_compat.h")} -Wno-deprecated-declarations')
         rt.append(o)
     objs['runtime'] = rt
     every = [o for v in objs.values() for o in v]
@@ -919,6 +930,9 @@ def main():
     stale = stale_shaders(RUNTIME)
     if stale:
         sys.exit(f'{stale[0]}: its SPIR-V header no longer matches; run python tools/build_shaders.py')
+    stale = stale_ffx_shaders(RUNTIME)
+    if stale:
+        sys.exit(stale[0])
     skip = {s for s in args.skip_runtime.split(',') if s}
     main_out = (ROOT / 'build' / args.version).resolve()
     pairs = None

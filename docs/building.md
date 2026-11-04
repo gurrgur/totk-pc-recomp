@@ -243,6 +243,23 @@ when a setting is described neither in `totk.ini.example` nor in [settings.md](s
 `.venv\Scripts\python tests\exefs_patches_test.py`, which makes its own modules and runs `gen.py` on one with a jump
 table (no game files), and `totk.exe --probe-mods`.
 
+Temporal super-resolution changes also run the standalone configuration and backend checks (no game files):
+
+```sh
+.venv/bin/python tests/super_resolution_config_test.py
+.venv/bin/python tests/dlss_backend_test.py
+.venv/bin/python tests/fsr3_backend_test.py
+.venv/bin/python tests/temporal_flow_test.py
+.venv/bin/python tests/temporal_backend_abi_test.py
+.venv/bin/python tests/motion_spirv_test.py
+.venv/bin/python tests/motion_descriptor_test.py
+.venv/bin/python tests/ffx_shader_test.py
+```
+
+`totk --probe-ffx` checks synthetic Vulkan FSR dispatches. Gameplay/quality/platform validation remains separate;
+see [super_resolution.md](super_resolution.md). The vendored SDK shader blobs are checked in;
+`tools/build_ffx_shaders.py` is needed only when changing their source or permutations.
+
 The lifter (`recomp/`) and the CPU headers (`runtime/cpu.h`, `runtime/simd.h`) are checked against Unicorn. Every lifter
 change passes these, all run with `.venv`:
 

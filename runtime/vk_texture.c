@@ -26,7 +26,7 @@
 #include "nvn_tex.h"
 #include "tex.h"
 #include "vk.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
 

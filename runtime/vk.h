@@ -272,7 +272,7 @@ uint64_t vk_mvprev_step(int stage, int index, uint64_t size);
 int vk_mvprev_on(void);
 void vk_mvprev_want(uint32_t index_mask);   // also keep these binding indices' last-frame copies (bit n: index n)   // DLAA on and TOTK_DLAA_OBJMV not 0, as of the last present
 int vk_mvprev_find(int index, uint64_t addr, uint64_t size, uint64_t *prev, int *how);
-void vk_mvprev_frame(void);   // each present, beside vk_dlaa_frame
+void vk_mvprev_frame(void);   // each present, beside vk_temporal_frame
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);
 int vk_mem_mirror_pending(void);

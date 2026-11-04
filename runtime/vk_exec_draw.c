@@ -28,7 +28,7 @@
 #include "vk.h"
 #include "vk_exec.h"
 #include "platform/platform.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
 
 #define MAX_BINDINGS 128
 #define MAX_DESC 1024
@@ -134,6 +134,7 @@ static struct {
 // again (the descriptors stay bound across pipeline binds of that layout).
 #define DS_SIG_BYTES (MAX_DESC * sizeof(VkDescSlot))
 static struct { uint32_t n[2], pn[2]; uint8_t sig[2][DS_SIG_BYTES], psig[2][DS_SIG_BYTES]; } DS;
+static struct { VkDescriptorSetLayout set_layout; VkPipelineLayout layout; VkDescriptorPool pool; VkDescriptorSet set; } push_reset;
 
 // TOTK_BIND_STATS counters (bind_stats).
 static struct {
@@ -440,6 +441,10 @@ void vk_exec_draw_shutdown(void) {
     if (!Z.ready) return;
     VkCtx *c = vk_ctx();
     twins_release(c);
+    if (push_reset.pool) vkDestroyDescriptorPool(c->device, push_reset.pool, NULL);
+    if (push_reset.layout) vkDestroyPipelineLayout(c->device, push_reset.layout, NULL);
+    if (push_reset.set_layout) vkDestroyDescriptorSetLayout(c->device, push_reset.set_layout, NULL);
+    memset(&push_reset, 0, sizeof push_reset);
     for (int i = 0; i < DV_COUNT; i++) {
         if (Z.img[i].sview != Z.img[i].view) vkDestroyImageView(c->device, Z.img[i].sview, NULL);
         vkDestroyImageView(c->device, Z.img[i].view, NULL);
@@ -1469,12 +1474,14 @@ static Twin *twin_update(VkExec *ex, const VkTexImage *img) {
 
 // The image descriptor of slot h; in a dispatch, a compare-sampled colour image the driver cannot compare is swapped
 // for its depth twin; in a pass larger than it, the scene's light target, once DLSS scaled it this frame, for DLSS's
-// output (vk_dlaa.c).
+// output (vk_temporal.c).
 static void tex_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate, VkDescriptorImageInfo *out) {
     tex_info_lookup(ex, r, h, storage, separate, out);
-    if (h && !storage && vk_dlaa_swap_img && ex->in_pass && ex->pass_w > vk_dlaa_swap_img->width + 1 &&
-        vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL) == vk_dlaa_swap_img)
-        out->imageView = vk_dlaa_swap_view, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    if (h && !storage && vk_temporal_swap_img && ex->in_pass && ex->pass_w > vk_temporal_swap_img->width + 1 &&
+        vk_texture_by_id_locked((int)(h & 0xfffff), NULL, NULL) == vk_temporal_swap_img) {
+        out->imageView = vk_temporal_swap_view, out->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        vk_temporal_sampled();
+    }
     if (!twin_dispatch || storage || separate || !h || !(r->type & 0x400)) return;
     VkImageViewType vt = res_view_type(r->type);
     if (vt != VK_IMAGE_VIEW_TYPE_2D && vt != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
@@ -1514,6 +1521,32 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
     }
     rt_fatal("vk: descriptor set allocation failed twice");
     return VK_NULL_HANDLE;
+}
+
+// Validation-layer runs can retain stale push metadata across independent-layout changes, even with set 1 bound first.
+// Binding an ordinary empty set at set 0 explicitly replaces that metadata; real descriptors follow before drawing.
+static int reset_push_descriptors(VkCommandBuffer cb) {
+    VkCtx *c = vk_ctx();
+    if (!c->validation) return 0;
+    if (!push_reset.set) {
+        VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        if (vkCreateDescriptorSetLayout(c->device, &si, NULL, &push_reset.set_layout) != VK_SUCCESS)
+            rt_fatal("vk: validation descriptor reset set layout failed");
+        VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                          .setLayoutCount = 1, .pSetLayouts = &push_reset.set_layout};
+        if (vkCreatePipelineLayout(c->device, &li, NULL, &push_reset.layout) != VK_SUCCESS)
+            rt_fatal("vk: validation descriptor reset pipeline layout failed");
+        VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1};
+        if (vkCreateDescriptorPool(c->device, &pi, NULL, &push_reset.pool) != VK_SUCCESS)
+            rt_fatal("vk: validation descriptor reset pool failed");
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                          .descriptorPool = push_reset.pool, .descriptorSetCount = 1,
+                                          .pSetLayouts = &push_reset.set_layout};
+        if (vkAllocateDescriptorSets(c->device, &ai, &push_reset.set) != VK_SUCCESS)
+            rt_fatal("vk: validation descriptor reset allocation failed");
+    }
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, push_reset.layout, 0, 1, &push_reset.set, 0, NULL);
+    return 1;
 }
 
 static void support_in(const VkExec *ex, float in[3]) {   // what support_fill reads: viewport size, point size
@@ -1912,31 +1945,17 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
         }
         nd += cnt;
     }
-    // Under the validation layer, a new graphics layout binds set 1 before set 0 is pushed or bound. The layer (SDK
-    // 1.4.363, PipelineLayoutCompatDef::operator==) takes any two INDEPENDENT_SETS layouts as compatible, so
-    // vkCmdPushDescriptorSetKHR keeps the push set it made for an earlier layout and drops writes to bindings that
-    // layout lacks (false VUID-vkCmdDrawIndexed-None-08114, then an access violation inside the layer). A bind at set 1
-    // disturbs set 0 by its canonical id, which drops the layer's push set: the push after it gets a new one.
-    int set1_first = 0;
     if (gfx && info->layout != B.ds_layout) {   // another layout: sets bound before may be disturbed
+        if (info->push || info->push1) RS.cmds += reset_push_descriptors(ex->cb);
         B.ds_layout = info->layout;
         B.ds_bound[0] = B.ds_bound[1] = VK_NULL_HANDLE;
         B.ds_pushed[0] = B.ds_pushed[1] = 0;
-        set1_first = n_sets == 2 && vk_ctx()->validation;
     }
-    for (uint32_t k = 0; k < n_sets; k++) {
-        uint32_t s = set1_first ? 1 - k : k, i0 = lo[s], i1 = hi[s];
+    for (uint32_t s = 0; s < n_sets; s++) {
+        uint32_t i0 = lo[s], i1 = hi[s];
         const VkDescSlot *ds = &d[d0[s]];
         uint32_t dbytes = (uint32_t)(((s + 1 < n_sets ? d0[s + 1] : nd) - d0[s]) * sizeof *d);
-        if (s && i1 == i0) {               // no fragment stage: set 1 is empty and unused
-            if (set1_first) {              // bound only to drop the layer's push set (comment above)
-                VkDescriptorSet set = alloc_set(ex, info->set_layout1);
-                vkCmdBindDescriptorSets(ex->cb, info->bind_point, info->layout, 1, 1, &set, 0, NULL);
-                B.ds_bound[1] = set, B.ds_pushed[1] = 0;
-                RS.cmds++;
-            }
-            continue;
-        }
+        if (s && i1 == i0) continue;   // no fragment stage: set 1 is empty and unused
         if (s ? info->push1 : info->push) {
             uint32_t n = gfx && push_skip_on() ? dbytes : 0;
             if (n && B.ds_pushed[s] && DS.pn[s] == n && !memcmp(DS.psig[s], ds, n)) {
@@ -2019,7 +2038,7 @@ static VkViewport draw_viewport(VkExec *ex) {
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     VkViewport v = {x, y + h, w, -h, ex->depth_range[0], ex->depth_range[1]};   // the y flip: negative height
-    vk_dlaa_viewport(ex, &v);   // the scene's draws move by the DLAA jitter
+    vk_temporal_viewport(ex, &v);   // the scene's draws take the shared temporal jitter
     return v;
 }
 
@@ -2229,7 +2248,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         if (fs_wait) fs = shader_for(ex, NVN_STAGE_FS, &has_fs, NULL, 1);
     }
     if (!vs || (has_fs && !fs)) return 0;
-    if (vk_dlaa_skip_draw(ex, fs)) return 0;   // the game's FXAA off, or its scaling replaced by DLSS (vk_dlaa.c)
+    if (vk_temporal_skip_draw(ex, fs)) return 0;   // FXAA off, or scaling already resolved (vk_temporal.c)
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs;
@@ -2313,7 +2332,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
         B.st = s, B.st_valid = 1;
         if (ex->mark && vk_exec_frame.draws == ex->mark_draws0) ex->mark->first[0] = vs, ex->mark->first[1] = fs;
     }
-    vk_dlaa_draw(ex);
+    vk_temporal_draw(ex);
     vk_mvsurvey_draw(ex);
     vk_mvprev_draw(ex);
     record_fixed(ex);
@@ -2329,7 +2348,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
 }
 
 // ---- per-object motion
-// The camera pass (vk_dlaa.c mv_pass) gives everything the camera's motion, so a character that moves with the camera,
+// The camera pass (vk_temporal.c mv_pass) gives everything the camera's motion, so a character that moves with the camera,
 // or on its own, gets the wrong one and DLSS throws its history away there. Each solid scene draw whose position reads
 // an object's own uniform blocks (bones c5, place c7, c6; mvobj_draw_ says which are left out and why) is therefore
 // drawn a second time (listed during the replay, MQ, and recorded by mv_pass) with its vertex shader's last-frame
@@ -2338,7 +2357,7 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
 // position minus this frame's. The draw keeps everything else of the original: vertex and index buffers, the other
 // uniform blocks, the jittered viewport and the scene depth, tested with the game's own test and its equal case
 // (LEQUAL, GEQUAL) without writes, so only the visible surface writes its vector. Last frame's blocks:
-// vk_mvprev_find and mo_prev_block; the camera: vk_dlaa_prev_camera. A draw whose variant or pipeline is still
+// vk_mvprev_find and mo_prev_block; the camera: vk_temporal_prev_camera. A draw whose variant or pipeline is still
 // building, or whose last-frame blocks are not in the snapshot, keeps the camera's motion. TOTK_DLAA_OBJMV=0 turns it
 // off (vk_mvprev.c).
 #include "vk_mvobj_fs.h"
@@ -2593,6 +2612,7 @@ static void mo_emit(VkCommandBuffer cb) {
         if (!p || memcmp(q->bias, p->bias, sizeof q->bias)) vkCmdSetDepthBias(cb, q->bias[0], q->bias[1], q->bias[2]);
         uint32_t n_sets = info->n_sets ? info->n_sets : 1;
         const VkDescSlot *d = MQ.desc + q->desc;
+        if ((info->push || info->push1) && lay[0] != info->layout) reset_push_descriptors(cb);
         for (uint32_t s = 0, i0 = 0, k0 = 0; s < n_sets && s < 2; s++) {
             uint32_t i1 = i0, k1 = k0;
             while (i1 < info->n_bindings && (n_sets == 1 || info->bindings[i1].set == s))
@@ -2764,7 +2784,7 @@ static int mo_prev_cached(int index, const p_bind_buf *u, VkDescriptorBufferInfo
 static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSize ib_off, uint64_t t0) {
     mvobj_banks(ex);
     const VkExecTarget *z = &ex->depth;
-    if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT || B.st.samples > 1 || B.st.raster_discard)
+    if (!z->image || z->width < TEMPORAL_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT || B.st.samples > 1 || B.st.raster_discard)
         return;
     // solid geometry only, which tests and writes the scene depth: effects, particles and screen quads write none, and
     // drawn again they would put their motion on the surfaces behind them (DLSS takes those from the surface)
@@ -2841,7 +2861,7 @@ static void mvobj_draw_(VkExec *ex, const p_draw_idx *d, VkBuffer ib, VkDeviceSi
     // last frame's camera and blocks; held still when none of the position's blocks changed (most of the scenery)
     VkDescriptorBufferInfo cam, prevb[17];
     float jit[2];
-    if (!vk_dlaa_prev_camera(&cam, jit)) {
+    if (!vk_temporal_prev_camera(&cam, jit)) {
         MO.nodata++, MO.why[0]++;
         return;
     }
@@ -3050,7 +3070,7 @@ int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth
     for (int i = 0; i < 16 && MF[i].n && fo < (int)sizeof fm_last - 40; i++)
         fo += snprintf(fm_last + fo, sizeof fm_last - fo, " %#x/%#x:%u", MF[i].mask, MF[i].chg, MF[i].n);
     if (!fo) fm_last[0] = 0;
-    // only draws with the scene camera block (vk_dlaa.c mv_pass's): last frame's camera they get is that block's, and
+    // only draws with the scene camera block (vk_temporal.c mv_pass's): last frame's camera they get is that block's, and
     // a draw of another view would move by the difference between the two views
     int kept = 0;
     for (int i = 0; i < MQ.n; i++)

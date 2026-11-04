@@ -38,6 +38,7 @@ extern "C" {
 #include "amiibo.h"
 #include "cheats.h"
 #include "cfg.h"
+#include "super_resolution.h"
 #include "fs.h"
 #include "input.h"
 #include "input_map.h"
@@ -679,12 +680,15 @@ static void tab_screen(float scale) {
     row_shadow_range();
     opt_slider("TOTK_PCSS", UI_MENU_PCSS, 0, 200, UI_MENU_PCSS_DESC, 10, "%.0f %%");
     opt_slider("TOTK_CONTACT_SHADOWS", UI_MENU_CONTACT_SHADOWS, 0, 100, UI_MENU_CONTACT_SHADOWS_DESC, 10, "%.0f %%");
-    opt_toggle("TOTK_DLAA", UI_MENU_DLAA, UI_MENU_DLAA_DESC);
-    static const UiTextId dlss[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
+    static const UiTextId methods[] = {UI_MENU_OFF, UI_MENU_SR_FSR3, UI_MENU_SR_DLSS};
+    opt_choice("TOTK_SUPER_RESOLUTION", UI_MENU_DLAA, methods, 3, UI_MENU_DLAA_DESC);
+    static const UiTextId modes[] = {UI_MENU_DLSS_DLAA, UI_MENU_DLSS_QUALITY, UI_MENU_DLSS_BALANCED,
                                     UI_MENU_DLSS_PERFORMANCE, UI_MENU_DLSS_ULTRA};
-    opt_choice("TOTK_DLSS", UI_MENU_DLSS, dlss, 5, UI_MENU_DLSS_DESC);
-    static const UiTextId preset[] = {UI_MENU_DLSS_PRESET_DEFAULT, UI_MENU_DLSS_PRESET_K, UI_MENU_DLSS_PRESET_J};
-    opt_choice("TOTK_DLSS_PRESET", UI_MENU_DLSS_PRESET, preset, 3, UI_MENU_DLSS_PRESET_DESC);
+    opt_choice("TOTK_SUPER_RESOLUTION_MODE", UI_MENU_DLSS, modes, 5, UI_MENU_DLSS_DESC);
+    if (sr_method() == SR_DLSS) {
+        static const UiTextId preset[] = {UI_MENU_DLSS_PRESET_DEFAULT, UI_MENU_DLSS_PRESET_K, UI_MENU_DLSS_PRESET_J};
+        opt_choice("TOTK_DLSS_PRESET", UI_MENU_DLSS_PRESET, preset, 3, UI_MENU_DLSS_PRESET_DESC);
+    }
     static const UiTextId chars[] = {UI_MENU_DLSS_CHARS_OFF, UI_MENU_DLSS_CHARS_LIGHT, UI_MENU_DLSS_CHARS_MEDIUM,
                                      UI_MENU_DLSS_CHARS_FULL};
     opt_choice("TOTK_DLSS_CHAR_MASK", UI_MENU_DLSS_CHARS, chars, 4, UI_MENU_DLSS_CHARS_DESC);

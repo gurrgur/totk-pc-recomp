@@ -209,6 +209,8 @@ class ReleaseFilesTest(unittest.TestCase):
             used |= set(re.findall(r"'(\w+\.py)'", names))
         self.assertIn('cheats.py', used)
         self.assertEqual(used - set(make_release.TOOLS_FILES), set())
+        # build_game imports the SDK shader freshness checker even with a prebuilt runtime library.
+        self.assertIn('build_ffx_shaders.py', make_release.TOOLS_FILES)
 
 
 class RenamedVersionTest(unittest.TestCase):

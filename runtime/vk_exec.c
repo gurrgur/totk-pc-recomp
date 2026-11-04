@@ -27,7 +27,7 @@
 #include "tex.h"
 #include "vk.h"
 #include "vk_exec.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
 
 #define WEAK __attribute__((weak))
 #define CALL_DEPTH 8
@@ -592,7 +592,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
     resolve_rt(ex);
     vk_contact_pass_begin(ex);
-    vk_dlaa_pass(ex);   // DLAA runs before the bloom chain's first pass (vk_dlaa.c)
+    vk_temporal_pass(ex);   // resolve before bloom, or at the game's scaling pass (vk_temporal.c)
     // Learned targets (VkTexImage.fb_learned) are attached in the feedback layout
     VkImage want[9];
     VkImageAspectFlags wasp[9];

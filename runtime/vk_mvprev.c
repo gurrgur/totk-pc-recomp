@@ -1,4 +1,4 @@
-// Last frame's object and bone blocks, for per-object motion vectors (TOTK_DLAA_OBJMV, on with DLAA). The banks kept
+// Last frame's object and bone blocks, for shared per-object motion (legacy knob TOTK_DLAA_OBJMV). The banks kept
 // start as c5, c7 and c14 and grow with what the vertex shader variants read (vk_mvprev_want); c7 and c5 are described
 // here, the others follow the same two-copy rule.
 //
@@ -27,7 +27,7 @@
 #include "host.h"
 #include "vk.h"
 #include "vk_exec.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
 
 #define CHECK 128u
 #define TABLE (1u << 14)
@@ -46,7 +46,7 @@ typedef struct {
 typedef struct { uint64_t blocks, self, side, nearer, none, checked, intact, still, small, big; } Stat;
 
 static struct {
-    int on;          // 1 knob on and DLAA on this frame
+    int on;          // 1 object-motion knob and selected temporal backend active this frame
     int knob;        // -1 not read
     Seen *t[2];      // this frame's bound blocks, last frame's
     uint8_t (*bytes[2])[CHECK];   // TOTK_MVPREV_CHECK: the first CHECK bytes of each entry of t[k], NULL without the check
@@ -133,7 +133,7 @@ void vk_mvprev_draw(VkExec *ex) {
 
 static void mvprev_draw_(VkExec *ex) {
     const VkExecTarget *z = &ex->depth;
-    if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
+    if (!z->image || z->width < TEMPORAL_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
     int check = P.bytes[0] != NULL;   // TOTK_MVPREV_CHECK=1: the summary's checks (3.6 ms a frame)
     for (int index = 0; index < BANKS; index++) {
         if (!(P.mask >> index & 1)) continue;
@@ -172,8 +172,8 @@ static void mvprev_draw_(VkExec *ex) {
 }
 
 void vk_mvprev_frame(void) {
-    // without DLSS (no NGX, no RTX GPU, dlaa = 0) nothing reads last frame's blocks: P.on stays 0, no tables
-    if (!vk_dlaa_available()) return;
+    // Both temporal backends use these blocks; Off and permanent backend failure stop capture.
+    if (!vk_temporal_available()) { P.on = 0; return; }
     if (P.knob < 0) {
         P.knob = rt_knob("DLAA_OBJMV", "1");
         if (P.knob) {
@@ -186,7 +186,7 @@ void vk_mvprev_frame(void) {
             P.timed = rt_knob("MVOBJ_TIMES", "0");
         }
     }
-    int on = P.knob && cfg_bool("TOTK_DLAA");
+    int on = P.knob;
     if (on != (P.on > 0)) {
         P.on = on ? 1 : -1;
         if (P.t[0]) memset(P.t[0], 0, TABLE * sizeof(Seen)), memset(P.t[1], 0, TABLE * sizeof(Seen));

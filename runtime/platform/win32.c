@@ -1446,6 +1446,8 @@ void *plat_lib_open(const char *name) {
 
 void *plat_lib_sym(void *lib, const char *name) { return lib ? (void *)GetProcAddress((HMODULE)lib, name) : NULL; }
 
+void plat_lib_close(void *lib) { if (lib) FreeLibrary((HMODULE)lib); }
+
 void plat_lib_error(char *out, size_t cap) { snprintf(out, cap, "error %lu", GetLastError()); }
 
 int plat_ngx_core_path(char *out, size_t cap) {

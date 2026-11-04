@@ -119,11 +119,13 @@ Every guest thread is a host thread. TotK assumes Horizon's scheduler: three app
   swapchain, which FSR 1 or the blit then scale; the in-game menu is drawn into an RGBA8 image and blended on at the
   HUD's white. Without an HDR10 surface format (Windows with "Use HDR" off, a compositor without colour management)
   the swapchain stays SDR. `TOTK_SHOTS` reads the window texture, so its pictures clip highlights in HDR.
-- DLAA (`vk_dlaa.c`, `dlaa`, off by default). NVIDIA DLSS at the scene's own size, through the driver's NGX core loaded
-  at run time (no SDK code compiled in). It runs on the R11G11B10F light target right before the bloom chain's first
-  pass, so post effects and the HUD read the anti-aliased picture. The scene's draws get a sub-pixel Halton viewport
-  jitter; camera motion vectors are reprojected from the scene depth through this and last frame's view-projection of
-  the scene camera block (constant bank c4), in double precision on the CPU. Per-object motion (`dlaa_objmv`,
+- [Temporal super resolution](super_resolution.md) (`vk_temporal.c`, `super_resolution`, off by default) selects
+  built-in AMD FSR 3.1 (`vk_fsr3_backend.cpp`) or NVIDIA DLSS/DLAA (`vk_dlss.c`, NGX loaded at run time).
+  Native AA resolves the scene before bloom; upscaling resolves into an output-sized image and reuses the existing
+  sampled-image substitution so later scaling draws cannot overwrite it with the jittered scene. The original post
+  effects and HUD remain. Both backends share scene selection, sub-pixel Halton viewport jitter, and camera motion
+  reprojected from scene depth through the current/previous camera block (constant bank c4), in double precision
+  on the CPU. Per-object motion (`dlaa_objmv` is retained as a diagnostic knob,
   `vk_mvprev.c`, the per-object section of `vk_exec_draw.c`, translator patch 0015): solid scene draws whose position
   reads an object's own uniform blocks (bones c5, place c7, c6) are drawn a second time with a vertex shader variant
   that computes last frame's position from last frame's blocks (the game writes them into two copies that take turns;

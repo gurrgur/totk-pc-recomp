@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-# Per-file allowlist of shared files that still use Win32, with the reason. Empty: every shared file is portable.
+# Per-file allowlist of shared files that still use Win32, with the reason.
 ALLOWED = {}
 
 INCLUDE = re.compile(r'^\s*#\s*include\s*[<"](windows|winsock2|ws2tcpip|synchapi|memoryapi|processthreadsapi|'

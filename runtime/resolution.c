@@ -38,6 +38,7 @@
 #include <zstd.h>
 
 #include "cfg.h"
+#include "super_resolution.h"
 #include "host.h"
 #include "mods.h"
 #include "platform/platform.h"
@@ -53,19 +54,20 @@
 
 static struct {
     int decided;
+    int method;               // restart-only backend, captured with the initial scene sizes
     unsigned ow, oh, sw, sh;   // output and scene
     int scene_set;             // the scene differs from the game's 5/6 of the output
     int heapdef_ok;            // romfs.c serves the grown HeapDef
     int on;                    // res_init switched the patch sets on
     unsigned shadow;           // fixed sun shadow map size (TOTK_SHADOW_RES), 0: the game's own
-    double dlss_k;             // TOTK_DLSS quality/balanced/performance/ultra_performance: the scene's share of the output, else 0
-    double base_k;             // the scene's share without a DLSS mode (render_scale, or the game's 5/6)
-    unsigned hw, hh;           // the largest scene a DLSS mode change can ask for: the heap is sized for it
-    int live;                  // 1.4.3 with DLSS able to run: the DLSS mode can change while the game runs
+    double dlss_k;             // temporal super resolution's scene share, else 0 (name kept for renderer hooks)
+    double base_k;             // render_scale, or the game's 5/6, restored on backend failure
+    unsigned hw, hh;           // largest scene a live mode change can ask for
+    int live;                  // 1.4.3 with FSR3 or an available DLSS model
 } R;
 
 // The scene size is decided before the device exists, so NGX cannot be asked yet. NGX loads DLSS from nvngx_dlss.dll
-// next to totk.exe on Windows, libnvidia-ngx-dlss.so.<version> next to totk on Linux (vk_dlaa.c vk_dlaa_init):
+// next to totk.exe on Windows, libnvidia-ngx-dlss.so.<version> next to totk on Linux (vk_dlss.c vk_dlss_init):
 // without that file DLSS never runs, and a DLSS mode would leave the game's plain scaling at 50..67 % of the output.
 static int dlss_dll(void) {
 #ifdef _WIN32
@@ -91,23 +93,27 @@ static int dlss_dll(void) {
 #endif
 }
 
-// The scene size for a share k of the output, within SCENE_MAX per side.
+// Temporal Native AA needs the full output; ordinary render_scale keeps the existing per-side cap.
 static void scene_for(double k, unsigned *w, unsigned *h) {
     double sw = R.ow * k, sh = R.oh * k;
-    double fit = fmin(1.0, fmin(SCENE_MAX / sw, SCENE_MAX / sh));
+    double limit = R.method == SR_OFF ? SCENE_MAX : fmax(SCENE_MAX, fmax(R.ow, R.oh));
+    double fit = fmin(1.0, fmin(limit / sw, limit / sh));
     *w = (unsigned)(sw * fit + 0.5);
     *h = (unsigned)(sh * fit + 0.5);
 }
 
-// The scene's share of the output for a TOTK_DLSS mode; 0 for dlaa (the scene keeps base_k), while DLSS/DLAA is off
-// (the mode the menu still holds would shrink the scene for the plain upscaler) and where DLSS cannot run (dlss_dll).
+// FSR3 needs no vendor model. DLSS must have its model before shrinking the game's scene.
+// "off" requests render_scale after backend failure; res_dlss_mode requires live recreation to apply it.
 static double dlss_share(const char *m) {
     static const struct { const char *name; double k; } dlss[] = {
-        {"quality", 2.0 / 3.0}, {"balanced", 0.58}, {"performance", 0.5}, {"ultra_performance", 1.0 / 3.0}};
+        {"native", 1.0}, {"quality", 2.0 / 3.0}, {"balanced", 0.58}, {"performance", 0.5},
+        {"ultra_performance", 1.0 / 3.0}};
     static int dll = -1;
-    if (!cfg_bool("TOTK_DLAA")) return 0;
+    int method = R.method;
+    if (!strcmp(m, "off") || method == SR_OFF) return 0;
     for (int i = 0; i < (int)(sizeof dlss / sizeof dlss[0]); i++)
         if (!strcmp(m, dlss[i].name)) {
+            if (method == SR_FSR3) return dlss[i].k;
             if (dll < 0 && !(dll = dlss_dll())) {
 #ifdef _WIN32
                 rt_log("resolution: DLSS %s needs nvngx_dlss.dll next to totk.exe, which is missing: the scene follows "
@@ -144,6 +150,7 @@ static void shape_fallback(void) {
 static void decide(void) {
     if (R.decided) return;
     R.decided = 1;
+    R.method = sr_method();
     R.ow = BASE_W;
     R.oh = BASE_H;
     const char *o = cfg_value("TOTK_OUTPUT_RES");
@@ -168,19 +175,17 @@ static void decide(void) {
             rt_log("resolution: TOTK_RENDER_SCALE=%s is not game or a percentage 25..400; game", s);
         }
     }
-    // A DLSS mode other than dlaa sets the scene size instead. On 1.4.3 with DLSS able to run (DLAA on, the DLL there)
-    // the mode can change while the game runs (res_dlss_mode): the scene patch is then always on and the heap is sized
-    // for the largest scene the modes ask for. Everyone else keeps the game's own scene size and its dynamic resolution
-    // unless render_scale or a DLSS mode asks for another, and a heap sized for that scene alone.
+    // Live modes need room for Native AA and for restoring render_scale after backend failure.
     R.base_k = k;
-    R.live = RT_V143 && cfg_bool("TOTK_DLAA") && dlss_dll();
-    const char *m = cfg_value("TOTK_DLSS");
+    int method = R.method;
+    R.live = RT_V143 && (method == SR_FSR3 || (method == SR_DLSS && dlss_dll()));
+    const char *m = sr_mode();
     R.dlss_k = dlss_share(m);
-    if (R.dlss_k) rt_log("resolution: DLSS %s: the scene at %.0f %% of the output (render_scale ignored)", m, R.dlss_k * 100);
+    if (R.dlss_k) rt_log("resolution: super resolution %s: the scene at %.0f %% of the output (render_scale ignored)", m, R.dlss_k * 100);
     double sk = R.dlss_k ? R.dlss_k : k;
     if (R.live || R.dlss_k || R.ow * sk > SCENE_MAX || R.oh * sk > SCENE_MAX) R.scene_set = 1;
     scene_for(sk, &R.sw, &R.sh);
-    if (R.live) scene_for(fmax(k, 2.0 / 3.0), &R.hw, &R.hh);
+    if (R.live || R.dlss_k) scene_for(fmax(k, 1.0), &R.hw, &R.hh);
     else R.hw = R.sw, R.hh = R.sh;
     const char *sr = cfg_value("TOTK_SHADOW_RES");
     if (strcmp(sr, "game")) {
@@ -520,8 +525,8 @@ void res_init(void) {
            scene_on ? "" : " (the game's own 5/6 of the output)", (unsigned long long)res_heap_extra_kib());
 }
 
-// DLSS upscaling: textures are sampled for the output's resolution, not the scene's (NVIDIA's DLSS guide: a mip bias
-// of log2(render / output)), so their detail survives the scaling. 0 without a DLSS mode.
+// Temporal upscaling samples textures for the output: log2(render / output) preserves their detail.
+// The public hook name stays unchanged for renderer callers.
 float res_dlss_lod_bias(void) {
     decide();
     return R.dlss_k ? (float)log2(R.dlss_k) : 0.0f;
@@ -567,7 +572,7 @@ void res_wanted(unsigned out[2]) {
     out[0] = R.ow, out[1] = R.oh;
 }
 
-// A TOTK_DLSS change while the game runs (vk_dlaa.c, at a present): the new scene size goes to the patch page, where
+// A super-resolution mode change while the game runs (at a present): the new scene size goes to the patch page, where
 // the game reads it when it sets its render size (main+0x585e48). 1.4.3 does that once, at start: its renderer setup
 // (main+0x7000e67028) calls main+0x585bd0(renderer, force), which picks the console mode's sizes and flags the render
 // targets for re-creation. The setup call is caught through the function-entry hook (res_fn_hit, on only until then),
@@ -590,7 +595,7 @@ void res_present(Cpu *c) {
     static unsigned waited;
     if (g_fnprof && !renderer && ++waited == 1800) {
         g_fnprof = 0;
-        rt_log("resolution: the game's render size setup was not seen; DLSS modes change at the next start");
+        rt_log("resolution: the game's render size setup was not seen; super-resolution modes change at the next start");
     }
     if (!size_pending || !renderer) return;
     size_pending = 0;
@@ -606,8 +611,14 @@ int res_dlss_mode(const char *m) {
     decide();
     double k = dlss_share(m);
     if (k == R.dlss_k || !R.on) return 0;
+    // Only the discovered 1.4.3 renderer can recreate the running game's targets.
     if (!RT_V143 || !renderer) {
-        rt_log("resolution: DLSS %s takes effect at the next start (the game set its render size already)", m);
+        if (!strcmp(m, "off"))
+            rt_log("resolution: backend unavailable; the game's scaler keeps the current scene %ux%u until restart "
+                   "(live render-size recreation unavailable)", R.sw, R.sh);
+        else
+            rt_log("resolution: super resolution %s takes effect at the next start; current scene stays %ux%u "
+                   "(live render-size recreation unavailable)", m, R.sw, R.sh);
         return 0;
     }
     R.dlss_k = k;
@@ -619,7 +630,7 @@ int res_dlss_mode(const char *m) {
     memcpy((uint8_t *)rt_patch_page() + 16, sc, sizeof sc);
     R.sw = w, R.sh = h;
     size_pending = 1;
-    rt_log("resolution: DLSS %s: scene %ux%u", m, w, h);
+    rt_log("resolution: super resolution %s: scene %ux%u", m, w, h);
     return 1;
 }
 

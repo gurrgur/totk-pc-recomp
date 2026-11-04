@@ -1,12 +1,12 @@
 #version 450
-// Camera motion vectors for DLAA (vk_dlaa.c mv_pass): each pixel's depth is taken back to the world through this
+// Shared temporal camera motion vectors (vk_temporal.c mv_pass): each pixel's depth is taken back to the world through this
 // frame's view-projection and forward through last frame's; the vector is last frame's window position minus this
 // frame's, in render pixels, without the jitter (DLSS's default convention). Objects that move on their own get only
 // the camera's motion.
 // The camera block is TotK's scene uniform block (bound as c4 in the scene's vertex shaders): vec4 rows 3-6 are the
 // view-projection, rows of a row-major 4x4 with OpenGL clip depth (-w..w). The replay's viewports have negative
 // heights, so window y grows downwards from ndc y = +1, and depth is z_ndc * 0.5 + 0.5.
-// With pc.bias > 0 the pass also writes DLSS's bias mask (vk_dlaa.c, "characters"): G-buffer target 0 carries an object
+// With pc.bias > 0 the pass also writes DLSS's bias mask (vk_temporal.c, "characters"): G-buffer target 0 carries an object
 // class in green, above 64/255 for characters, creatures and what they hold (Link 253, others 125, held items 160;
 // terrain 0, foliage 32). A pixel gets pc.bias when a character covers it now, or covered the place its surface came
 // from last frame (the previous class mask, read through the motion vector, 3x3): there the history holds a moving

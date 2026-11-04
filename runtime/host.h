@@ -270,8 +270,8 @@ int res_heapdef_build(const void *in, size_t n, void **out, size_t *out_n);   //
                                                            // the grown heaps, malloc'd; 0 = cannot (logged)
 void res_heapdef_served(void);                             // romfs.c serves the grown table
 void res_init(void);                                       // after rt_patches_init: the patch page and the sets
-float res_dlss_lod_bias(void);                             // TOTK_DLSS upscaling: texture LOD bias (<= 0)
-int res_dlss_mode(const char *mode);                       // TOTK_DLSS changed while running: new scene size
+float res_dlss_lod_bias(void);                             // temporal upscaling: texture LOD bias (<= 0)
+int res_dlss_mode(const char *mode);                       // temporal quality changed while running: new scene size; "off" restores base scale
 void res_fn_hit(uint64_t addr, uint64_t x0);               // main.c fnprof_hit: catches the renderer at start
 void res_present(Cpu *c);                                  // nvnQueuePresentTexture: applies a pending scene size
 void res_sizes(unsigned out[2], unsigned scene[2]);      // the output and scene sizes in effect (the game's own
@@ -336,6 +336,7 @@ int probe_nvn(void), probe_nvn_tex(void);                  // nvn_probe.c, nvn_t
 int probe_window(void);                                    // gfx_window_probe.c
 int probe_shader(void);                                    // gfx_shader.c
 int probe_census_dir(char *dir, size_t n);                 // gfx_shader_probe.c: build/<version>/shaders for the probes
+int probe_ffx(void);                                       // ffx_probe.cpp, synthetic Vulkan FSR3 dispatches
 int probe_vkmem(void), probe_vkexec(void), probe_astc(void);                 // tex_probe.c, vk_exec_probe.c, astc_probe.c
 int probe_movie(void);                                     // movie_probe.c: host VP9 movie::Decoder on one RomFS movie
 int vk_pipeline_prepare_shaders(void);                     // vk_pipeline.c: --prepare-shaders (tools/prepare_shaders.py)

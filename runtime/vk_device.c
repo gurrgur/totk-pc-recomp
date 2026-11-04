@@ -10,7 +10,8 @@
 #include "host.h"
 #include "vk.h"
 #include "platform/platform.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
+#include "vk_temporal_backend.h"
 
 static VkCtx g_vk;
 static int g_ready;
@@ -79,7 +80,7 @@ static int create_instance(void) {
     if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     if (vk_hdr_wanted() && instance_ext_present(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))   // HDR10 surface formats
         ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
-    vk_dlaa_instance_exts(ext, &n_ext, 12);
+    vk_dlss_instance_exts(ext, &n_ext, 12);
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
                              .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
@@ -261,7 +262,7 @@ static int create_device(void) {
         CHAIN(fbl, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
         CHAIN(lr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR);
     }
-    vk_dlaa_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the seven below
+    vk_dlss_device_exts(ep, ne, ext, &n_ext, 40);   // NGX's; the eight slots after it stay for the seven below
     if (has_ext(ep, ne, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) { g_vk.has_memory_budget = 1; ext[n_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME; }
     // GPU timestamps on the CPU clock (vk_sync.c): the perf line splits GPU idle time into waiting for a submission or not.
     if (has_ext(ep, ne, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) { g_vk.has_calibrated = 2; ext[n_ext++] = VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME; }
@@ -374,7 +375,11 @@ static long g_errors_total;     // outlives the device so the probe can print it
 
 static void destroy_all(void) {
     gfx_window_release_vk();
-    if (g_vk.device) vkDeviceWaitIdle(g_vk.device);
+    if (g_vk.device) {
+        rec_drain();
+        vkDeviceWaitIdle(g_vk.device);
+        if (g_ready) vk_temporal_shutdown();
+    }
     if (g_vk.device) vk_astc_release();
     if (g_vk.device) vk_crumbs_release();
     if (g_vk.timeline) vkDestroySemaphore(g_vk.device, g_vk.timeline, NULL);
@@ -397,7 +402,7 @@ int vk_init(void) {
     plat_mutex_lock(&g_lock);
     if (!g_ready) {
         memset(&g_vk, 0, sizeof g_vk);
-        if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start(), vk_dlaa_init();
+        if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start(), vk_dlss_init(), vk_temporal_init();
         else destroy_all();
     }
     int ok = g_ready;
@@ -407,7 +412,12 @@ int vk_init(void) {
 
 void vk_shutdown(void) {
     plat_mutex_lock(&g_lock);
-    if (g_ready) { destroy_all(); g_ready = 0; }
+    if (g_ready) {
+        // Probes bypass vk_backend_shutdown; release any initialized backend before its device disappears.
+        vk_temporal_shutdown();
+        destroy_all();
+        g_ready = 0;
+    }
     plat_mutex_unlock(&g_lock);
 }
 

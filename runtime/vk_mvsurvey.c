@@ -4,7 +4,7 @@
 // have to be kept from the previous frame's uniform snapshot (vk_usnap.c). That works when a block's guest address
 // stands for the same object from one frame to the next, which this survey measures.
 //
-// For every scene draw (vertex stage, scene depth bound: D32 at least DLAA_SCENE_MIN_W wide, as vk_dlaa_draw), each user bank
+// For every scene draw (vertex stage, scene depth bound: D32 at least TEMPORAL_SCENE_MIN_W wide, as vk_temporal_draw), each user bank
 // (c3 + index) with a binding is noted: address, size and its first SNAP bytes as of the submit (the snapshot's copy).
 // At each frame the bank's blocks are compared with the previous frame's and the one before:
 //   repeat1 / repeat2   blocks whose address was bound in that bank one / two frames ago
@@ -33,7 +33,7 @@
 #include "host.h"
 #include "vk.h"
 #include "vk_exec.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
 
 #define BANKS 18
 #define SNAP 256u
@@ -146,7 +146,7 @@ void vk_mvsurvey_draw(VkExec *ex) {
     if (!S.on) survey_init();
     if (S.on < 0) return;
     const VkExecTarget *z = &ex->depth;
-    if (!z->image || z->width < DLAA_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
+    if (!z->image || z->width < TEMPORAL_SCENE_MIN_W || z->format != VK_FORMAT_D32_SFLOAT) return;
     for (int b = 0; b < BANKS; b++) {
         const p_bind_buf *u = &ex->ubo[0][b];
         if (!u->addr || !u->size) continue;

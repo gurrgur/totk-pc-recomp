@@ -20,6 +20,7 @@ Report problems as issues, following [CONTRIBUTING.md](CONTRIBUTING.md).
 - Takes NSP and XCI game files, and compressed NSZ and XCZ as they are: the setup unpacks them itself
 - 60 fps by default; up to 144 fps or the monitor's refresh rate (experimental)
 - Custom resolutions (1080p, 2k...), supersampling and AMD FSR 1 upscaling
+- [Super Resolution](docs/super_resolution.md): built-in AMD FSR 3.1 or NVIDIA DLSS / DLAA, with Native AA and upscale quality modes
 - NVIDIA DLSS / DLAA on RTX GPUs: the setup downloads `nvngx_dlss.dll` from NVIDIA's DLSS SDK repository
   (github.com/NVIDIA/DLSS, NVIDIA RTX SDK license) when it finds an RTX GPU; untick it in the setup to skip it
 - HDR10 output with peak, game and HUD brightness settings

@@ -148,10 +148,16 @@ Many rows below are developer tools that only act together with another setting 
 | `wb_exact` (default `1`) | `0` decides write-back of GPU-written textures by page only. | A target that shares a page with data the CPU writes can go unwritten, so a name label next to the reticle can blink. | Caution |
 | `wb_merge` (default `1`) | `0` copies GPU-written ranges back as plain copies instead of writing word by word the words that changed. | In mirror memory mode the GPU's copy can overwrite words the CPU wrote, which breaks effects such as falling rain and waterfall splashes. | Caution |
 
-## Motion vectors and DLSS
+## Motion vectors and temporal super resolution
+
+Player settings are `super_resolution` and `super_resolution_mode` in `totk.ini.example`; see
+[super_resolution.md](super_resolution.md). The developer controls below retain their historical DLAA/DLSS names
+but operate on the shared FSR/DLSS path unless they explicitly select NVIDIA behavior.
 
 | Setting | What it does | Effect of changing it | Safety |
 | --- | --- | --- | --- |
+| `dlaa` (default `0`) | Legacy method selector: `1` selects NVIDIA DLSS when `super_resolution` is absent. | Migration only; explicit new settings win, including Off. Requires restart. | Caution |
+| `dlss` (default `dlaa`) | Legacy DLSS quality mode; `dlaa` maps to Native AA when `super_resolution_mode` is absent. | Migration only; use the shared quality setting for new configurations. | Caution |
 | `dlaa_jitter` (default `1`) | `0` turns off the camera jitter fed to DLSS. | DLSS gets no jitter between frames; a test setting. | Caution |
 | `dlaa_maskdebug` (default `0`) | `1` shows the reactive mask in place of the picture. | The frame shows a debug image while it is set. | Caution |
 | `dlaa_mv` (default `1`) | `0` sends zero motion vectors to DLSS. | DLSS sees no motion, so moving content can smear; a test setting. | Caution |

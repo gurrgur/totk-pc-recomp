@@ -1,5 +1,5 @@
 // TOTK_MV_CHECK=<frames> (test): measures how well DLSS's motion vectors explain the picture, without screenshots or
-// judging by eye. Every <frames> DLAA frames, vk_dlaa.c mv_pass copies to host memory the scene light target of that
+// judging by eye. Every <frames> DLAA frames, vk_temporal.c mv_pass copies to host memory the scene light target of that
 // frame and of the frame before (before DLSS, so jittered), and the motion image twice: after the camera pass (camera
 // only) and after the per-object pass (what DLSS gets). Once the GPU is done, the completion thread compares them:
 //   warp error: the frame before, sampled bilinearly at p + mv + d, against this frame at p, as a relative luminance
@@ -34,7 +34,7 @@
 #include "nvn_api.h"
 #include "vk.h"
 #include "vk_exec.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
 
 #define FLOW_MAX 20000
 #define OBJ_MIN 0.25f   // final and camera vectors differ by more than this (render pixels): an object pixel
@@ -425,7 +425,7 @@ out:
     __atomic_store_n(&K.busy, 0, __ATOMIC_RELEASE);
 }
 
-// ---- capture (vk_dlaa.c mv_pass)
+// ---- capture (vk_temporal.c mv_pass)
 
 void vk_mvcheck_camera(VkCommandBuffer cb, VkImage mv, uint32_t w, uint32_t h, float jx, float jy) {
     K.check = 0;
@@ -463,7 +463,7 @@ void vk_mvcheck_final(VkCommandBuffer cb, uint64_t fence, VkImage mv, VkImage ci
     K.prev_frame = frame, K.prev_u[0] = jx, K.prev_u[1] = jy, K.w = w, K.h = h, K.cfmt = cfmt;
 }
 
-// After DLSS ran on a check frame (vk_dlaa.c evaluate): its output (RGBA16F, ow x oh) for the analysis, which runs once
+// After DLSS ran on a check frame (vk_temporal.c evaluate): its output (RGBA16F, ow x oh) for the analysis, which runs once
 // the submission is done.
 void vk_mvcheck_output(VkCommandBuffer cb, VkImage out, uint32_t ow, uint32_t oh) {
     if (!K.want_out) return;

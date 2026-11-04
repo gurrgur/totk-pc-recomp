@@ -22,7 +22,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
-#include "vk_dlaa.h"
+#include "vk_temporal.h"
 #include "platform/platform.h"
 
 #define ALIGN 256u
@@ -35,9 +35,9 @@ typedef struct Arena {
     VkBuffer buf;
     VmaAllocation alloc;
     uint8_t *map;
-    uint8_t *cpu;    // with DLSS (vk_dlaa_available), the same bytes in host memory for the CPU's reads (vk_usnap_bytes):
+    uint8_t *cpu;    // with temporal rendering, the same bytes in host memory for CPU reads (vk_usnap_bytes):
                      // map is often device memory through the BAR, written fast but read back at about a microsecond a
-                     // cache line. Without DLSS nothing reads them back, and the bytes go into map in one copy.
+                     // cache line. Without temporal rendering nothing reads them back; map takes a single copy.
     uint64_t size;
 } Arena;
 
@@ -85,7 +85,7 @@ static Arena *arena_get(uint64_t need) {
     if (!a) rt_fatal("vk_usnap: out of memory");
     a->size = need < ARENA_MIN ? ARENA_MIN : (need + (1u << 20) - 1) & ~(uint64_t)((1u << 20) - 1);
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = a->size,
-                             // transfer source: DLAA copies the camera block out (vk_dlaa.c mv_pass)
+                             // transfer source: shared camera capture (vk_temporal.c mv_pass)
                              .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
     // Device-local through the BAR when the device has it (the GPU reads constants on every draw), else host memory.
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
@@ -285,7 +285,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total))) return;
     uint8_t *dst = U.arena->map;
-    if (vk_dlaa_available()) {
+    if (vk_temporal_available()) {
         if (!U.arena->cpu && !(U.arena->cpu = malloc(U.arena->size))) rt_fatal("vk_usnap: out of memory");
         dst = U.arena->cpu;
     }
