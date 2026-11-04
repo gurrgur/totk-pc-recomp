@@ -37,7 +37,7 @@
 // to the frame's end, draws in passes larger than the light target sample DLSS's output in its place
 // (vk_temporal_swap_img, applied by vk_exec_draw.c tex_info): whichever shader scales, it scales DLSS's picture.
 static struct {
-    VkExecTarget color, depth;   // the armed pair, valid in the frame it was armed
+    VkExecTarget color, depth;   // largest current-frame G-buffer depth and its first light target
     int armed, done, gbuf;       // this frame: scene armed, resolve succeeded, G-buffer observed
     int ended, up;               // scene ended (jitter over), successful resolve wrote scaled output
     struct Size {                // common work images and optional DLSS feature per render/output size
@@ -734,7 +734,7 @@ void vk_temporal_draw(VkExec *ex) {
     const p_bind_buf *b = &ex->ubo[0][1];   // constant bank c4: the replay keeps user banks from c3 on
     const VkExecTarget *z = &ex->depth;
     if (b->size == 0x940 && b->addr && z->image && z->width >= TEMPORAL_SCENE_MIN_W && z->format == VK_FORMAT_D32_SFLOAT &&
-        (!D.armed || z->image == D.depth.image))
+        D.gbuf && z->image == D.depth.image)
         D.cam_addr = b->addr, D.cam_depth = z->image;
 }
 
@@ -953,7 +953,9 @@ void vk_temporal_pass(VkExec *ex) {
     // arms the frame; at night the game draws into the light target alone with the scene depth before the G-buffer too,
     // and DLAA then ran at a small pass ahead of the whole scene, which reached the screen jittered.
     if (ex->pass_ncolor >= 3 && z->image && z->format == VK_FORMAT_D32_SFLOAT && z->width >= TEMPORAL_SCENE_MIN_W) {
-        D.gbuf = 1, D.armed = 0;
+        // Half-size auxiliary G-buffers and light passes must not end the main scene or replace its camera.
+        if (D.gbuf && (z->width < D.depth.width || z->height < D.depth.height)) return;
+        D.gbuf = 1, D.armed = 0, D.depth = *z;
         // target 0 is the object-class buffer (RGBA8, the scene size): the characters' bias mask reads its green. A
         // smaller pass of the same shape (640x360, seen while loading) does not replace the scene's in the same frame.
         if (c->image && c->format == VK_FORMAT_R8G8B8A8_UNORM && c->width == z->width && c->height == z->height &&
@@ -961,13 +963,12 @@ void vk_temporal_pass(VkExec *ex) {
             D.ids = *c, D.ids_ok = 1;
         return;
     }
-    // the scene depth is D32F; a D16 target of the scene size also serves one composite pass before the transparents.
-    // A smaller pair never takes over an armed one: the camera rune draws a half-size RGBA16F target with a half-size
-    // D32F depth after the lighting (852x480 under a 1704x960 scene), and DLSS ran on that and wrote its picture into
-    // the scene's own light target, which left every object black.
-    if (D.gbuf && ex->pass_ncolor == 1 && c->image && scene_color(c->format) && z->image && z->format == VK_FORMAT_D32_SFLOAT &&
+    // Match the main G-buffer depth, not an earlier half-size light pass that would end the scene too soon.
+    // Keep its first light target: a later equal-size effect target shares depth but is not sampled by scaling.
+    // The scene-size D16 composite and the camera rune's half-size D32F target are not the scene either.
+    if (D.gbuf && z->image == D.depth.image && ex->pass_ncolor == 1 && c->image && scene_color(c->format) && z->image && z->format == VK_FORMAT_D32_SFLOAT &&
         c->width == z->width && c->height == z->height && c->width >= TEMPORAL_SCENE_MIN_W &&
-        (!D.armed || (c->width >= D.color.width && c->height >= D.color.height)) &&
+        (!D.armed || c->image == D.color.image) &&
         c->samples <= 1 && !c->is3d) {
         int first = !D.armed;
         D.color = *c, D.depth = *z, D.armed = 1;

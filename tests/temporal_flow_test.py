@@ -62,11 +62,36 @@ static VkExec scene(void) {
 static void arm(VkExec *ex) {
     vk_temporal_pass(ex);
     assert(D.gbuf && !D.armed);
+    vk_temporal_draw(ex);
+    assert(D.cam_addr == ex->ubo[0][1].addr && D.cam_depth == ex->depth.image);
+    // Auxiliary G-buffer/light passes precede the main light: never arm or freeze the main camera on them.
+    VkExec aux = *ex;
+    aux.depth.image = (VkImage)12;
+    aux.depth.width = aux.color[0].width = aux.pass_w = 640;
+    aux.depth.height = aux.color[0].height = aux.pass_h = 360;
+    aux.ubo[0][1].addr = 0x12000;
+    vk_temporal_pass(&aux);
+    vk_temporal_draw(&aux);
+    aux.pass_ncolor = 1;
+    aux.color[0].format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    vk_temporal_pass(&aux);
+    vk_temporal_draw(&aux);
+    aux.pass_w = 120;
+    aux.depth.image = VK_NULL_HANDLE;
+    vk_temporal_pass(&aux);
+    assert(!D.armed && !D.ended && D.depth.image == ex->depth.image);
+    assert(D.cam_addr == ex->ubo[0][1].addr && D.cam_depth == ex->depth.image);
     ex->pass_ncolor = 1;
     ex->color[0].format = VK_FORMAT_R16G16B16A16_SFLOAT;
     vk_temporal_pass(ex);
     vk_temporal_draw(ex);
     assert(D.armed);
+    // Equal-size later effect targets share scene depth but are not the light texture consumed by scaling.
+    VkExec effect = *ex;
+    effect.color[0].image = (VkImage)13;
+    effect.color[0].img = (const VkTexImage *)13;
+    vk_temporal_pass(&effect);
+    assert(D.color.image == ex->color[0].image && D.color.img == ex->color[0].img);
 }
 
 int main(int argc, char **argv) {
@@ -151,6 +176,19 @@ int main(int argc, char **argv) {
         evaluate(&ex, NULL);
         assert(!D.done && fsr_calls == before && !D.camera_valid && D.reset);
         camera[33] = saved;
+        evaluate(&ex, NULL);
+        assert(D.done && dispatched.reset);
+    }
+
+    // Provenance remains mandatory: a valid matrix from another depth cannot reach FSR.
+    if (method == SR_FSR3) {
+        VkImage saved = D.cam_depth;
+        int before = fsr_calls;
+        D.cam_depth = (VkImage)99;
+        D.done = 0;
+        evaluate(&ex, NULL);
+        assert(!D.done && fsr_calls == before && !D.camera_valid && D.reset);
+        D.cam_depth = saved;
         evaluate(&ex, NULL);
         assert(D.done && dispatched.reset);
     }

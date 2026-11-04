@@ -92,17 +92,38 @@ or image quality. NVIDIA hardware and Windows need their own validation; mock NG
 
 ### Integration validation
 
+A follow-up 1080p output-marker check exposed two scene-selection bugs missed by the initial smoke checks:
+auxiliary passes could freeze the wrong camera, and a later effect target could replace the actual scene-light
+texture. The selected G-buffer depth now anchors camera/light selection; smaller auxiliary passes and later effect
+targets cannot replace that pair. Provenance checks remain mandatory. Successful loading-screen dispatches and
+zero Vulkan errors alone do not establish reconstruction in gameplay.
+
+After these fixes, separate 60-second Native and Quality gameplay runs each reached 3,600 resolves with stable
+history-reset counts. A live Quality → Native → Quality run reached 2,100 resolves. Temporary magenta markers
+in the backend output reached presented swapchain captures in both modes while the settings overlay stayed normal;
+control captures showed the scene normally. Marker injection and temporary diagnostics were removed before the
+final rebuild and sustained runs. This proves output consumption in the tested indoor scene, not perceptual quality
+or coverage of the user's separate outdoor scene, camera rune or night-time rendering.
+
 On Linux/RADV with an RX 9070 XT, object-motion-enabled Vulkan-validation smoke runs passed Native AA at
 1920×1080 and 5120×2880, all four upscale modes at 1920×1080 output, Off, and unavailable-DLSS fallback. Each
 reported zero validation errors, shader failures and skipped draws. Recorder/replay combinations `(on,on)`,
 `(off,off)`, `(on,off)` and `(off,on)` were exercised across these runs. A 15-second gameplay run with scripted
 camera/player input changed Native → Quality → Balanced → Performance → Ultra Performance → Native live;
-the game recreated its scene targets at every change and completed 4,339 presents without those failures.
+the game recreated its scene targets at every change and completed 4,339 presents without those failures. That
+run's sparse resolve logs did not establish that reconstruction continued throughout those presents.
 Debugger checks confirmed 40 object-motion draws replayed in a checked frame. Existing unused-fragment-output
 warnings also occur with Off; storage-image format warnings were fixed, not suppressed.
 
 The configuration, mock NGX, FSR lifecycle/fault-injection, shared-flow, ABI, motion SPIR-V/descriptor and shader
 format/freshness tests pass. The real-SDK GPU fixture passes dispatch, readback, context retirement and allocation
 failure/retry checks. Clean-config selftest, configuration, services, Vulkan execution and FSR probes pass.
+After rebasing onto `origin/dev` at `71d8b0c`, the full Linux build, standalone tests, SDK GPU fixture and clean
+runtime probes pass again. Post-rebase 60-second Native (recorder/replay on) and Quality (both off) runs each reach
+3,600 resolves; ten-second Balanced/Performance/Ultra Performance runs exercise the other recorder/replay combinations.
+A live Quality → Native → Quality run completes 4,183 presents with target recreation at each change. All report zero
+validation errors, shader failures and skipped draws. The automated save loader sets `TOTK_MENU_CURSOR=0` to avoid
+the desktop pointer selecting a different save slot; this does not change production menu-pointer defaults.
 Windows-target syntax checks pass, but Windows/NVIDIA execution, long sessions and quantitative temporal-image
-quality comparisons remain unverified. Game-derived captures and logs remain local under ignored `build/`.
+quality comparisons remain unverified. Full release packaging was not built; installer distribution tests pass.
+Game-derived captures and logs remain local under ignored `build/`.
