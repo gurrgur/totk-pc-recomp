@@ -401,9 +401,9 @@ static int resolve_check_on(void) {
     return on;
 }
 
-static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out);
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touch);
 
-int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
+static int resolve_span(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     uint64_t g = __atomic_load_n(&pool_gen, __ATOMIC_ACQUIRE), end = addr + size;
     const ResolveHit *h = rhit_slot(addr);
@@ -415,23 +415,27 @@ int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->cls = h->cls;
         out->pool = h->pool;
         if (h->alloc) out->alloc_offset = out->offset;
-        if (shadow_on && h->pool && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
+        if (touch && shadow_on && h->pool && !((PoolRec *)h->pool)->stouched) shadow_touch(h->pool);
         if (resolve_check_on()) {
             VkMemSpan s;
-            if (!resolve_locked(addr, size, &s) || memcmp(&s, out, sizeof s))
+            if (!resolve_locked(addr, size, &s, touch) || memcmp(&s, out, sizeof s))
                 rt_fatal("vk: resolve cache of 0x%llx differs from the pool index", (unsigned long long)addr);
         }
         return 1;
     }
-    return resolve_locked(addr, size, out);
+    return resolve_locked(addr, size, out, touch);
 }
 
 int vk_mem_span_live(const VkMemSpan *sp) {
     return sp->buffer && sp->pool && !sp->alloc && !shadow_on && ((const PoolRec *)sp->pool)->kind == POOL_IMPORT;
 }
 
+int vk_mem_resolve(uint64_t addr, uint64_t size, VkMemSpan *out) { return resolve_span(addr, size, out, 1); }
+
+int vk_mem_inspect(uint64_t addr, uint64_t size, VkMemSpan *out) { return resolve_span(addr, size, out, 0); }
+
 // The pool index lookup under the lock; a non-overlapped import or physical pool goes into the address's cache slot.
-static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
+static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out, int touch) {
     memset(out, 0, sizeof *out);
     plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
@@ -453,7 +457,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
         out->buffer = r->buf;
         out->offset = addr - r->import_lo;
         out->avail = r->import_hi - addr;
-        if (r->smap && !r->stouched) shadow_touch(r);
+        if (touch && r->smap && !r->stouched) shadow_touch(r);
         ok = 1;
     } else if (r && r->kind == POOL_PHYS) {
         out->buffer = r->buf;
