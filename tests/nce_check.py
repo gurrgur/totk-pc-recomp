@@ -574,6 +574,53 @@ class RuntimeChecks(unittest.TestCase):
         self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
 
 
+class GuardChecks(unittest.TestCase):
+    """runtime/nce.c site_at and valid_sp, copied out of the source and compiled with tests/nce_sites_check.c and
+    tests/nce_stack_check.c."""
+    @classmethod
+    def setUpClass(cls):
+        cls.work = ROOT / 'build/test/nce'
+        cls.work.mkdir(parents=True, exist_ok=True)
+        cls.nce = (ROOT / 'runtime/nce.c').read_text()
+        cls.marker = f'/* {n.GENERATED_MARKER}: copied from runtime/nce.c, synthetic data, not game data. */\n'
+
+    def build_run(self, name, sources, flags=()):
+        exe = self.work / name
+        subprocess.run([os.environ.get('CC', 'clang'), '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(ROOT / 'runtime'), '-I', str(self.work), *map(str, sources), *flags, '-o', str(exe)],
+                       check=True)
+        print(subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout.strip())
+
+    def test_site_lookup(self):
+        header = (ROOT / 'runtime/nce.h').read_text()
+        types = header[header.index('enum {'):header.index('typedef struct NceFrame')]
+        types = '#include <stddef.h>\n#include <stdint.h>\n' + types
+        tables = [[], [0], [0x1000, 0x1004, 0x1ffc, 0x9000, 0x90fc], [0x2000, 0x2004, 0x9ffc], [0x3000], []]
+        for module in range(9):
+            base = 0x10000000 + module * 0x100000
+            tables.append([base + (0 if i < 2048 else 0x80000) + (i % 2048) * 16 for i in range(4096)])
+        tables.append([(1 << 64) - 8, (1 << 64) - 4])
+        lines = [self.marker + types]
+        for i, keys in enumerate(tables):
+            if keys:
+                lines += [f'static const NceSite sites_{i}[] = {{', *(f'{{.pc = {pc}ull}},' for pc in keys), '};']
+        lines.append('const NceModule rt_nce_modules[] = {')
+        for i, keys in enumerate(tables):
+            # The text bounds are narrower than the keys on purpose: arena sites lie beyond a module's text.
+            lines.append(f'{{.base = {keys[0]}ull, .text_size = 0x8000, .sites = sites_{i}, '
+                         f'.site_count = {len(keys)}}},' if keys else '{.sites = NULL, .site_count = 0},')
+        lines += ['};', f'const unsigned rt_nce_module_count = {len(tables)};']
+        lines.append(source_function(self.nce, 'static const NceSite *site_at('))
+        (self.work / 'nce_sites.inc').write_text('\n'.join(lines))
+        self.build_run('nce_sites_check', [ROOT / 'tests/nce_sites_check.c'])
+
+    def test_stack_validation(self):
+        (self.work / 'nce_stack.inc').write_text(self.marker + source_function(self.nce, 'static void valid_sp('))
+        sdl = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'sdl3'], text=True))
+        self.build_run('nce_stack_check', [ROOT / 'tests/nce_stack_check.c', ROOT / 'runtime/platform/linux.c'],
+                       ['-Wno-missing-field-initializers', '-Wl,--wrap=plat_mem_readable', '-pthread', '-ldl', '-lm', *sdl])
+
+
 class HarnessChecks(unittest.TestCase):
     """Mod scanning and the loader's image checks, compiled from runtime sources against the fixture."""
     @classmethod

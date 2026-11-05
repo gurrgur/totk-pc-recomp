@@ -256,6 +256,7 @@ static const NceSite *site_at(uint64_t pc) {
     for (unsigned i = 0; i < rt_nce_module_count; i++) {
         const NceModule *m = &rt_nce_modules[i];
         uint64_t lo = 0, hi = m->site_count;
+        if (!hi || pc < m->sites[0].pc || pc > m->sites[hi - 1].pc) continue;
         while (lo < hi) {
             uint64_t mid = lo + (hi - lo) / 2;
             if (m->sites[mid].pc < pc) lo = mid + 1;
@@ -267,7 +268,10 @@ static const NceSite *site_at(uint64_t pc) {
 }
 
 static void valid_sp(uint64_t sp) {
-    if ((sp & 15) || sp < 32 || sp >= RT_ADDRESS_LIMIT || !plat_mem_readable(sp - 32, 32))
+    uint64_t end;
+    // Require the entire spill span to be owned logical RW, including a possible page crossing.
+    if ((sp & 15) || sp < 32 || sp >= RT_ADDRESS_LIMIT ||
+        plat_mem_state(sp - 32, sp, &end) != PLAT_PROT_RW || end != sp)
         rt_fatal("nce: invalid allocated guest stack");
 }
 
