@@ -118,6 +118,7 @@ static int memory_type(const VkCtx *c, uint32_t bits, VkMemoryPropertyFlags want
 
 // CPU-visible storage: the guest pages themselves become the buffer's memory (VK_EXT_external_memory_host).
 static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
+    if (plat_mem_watch_faults()) shadow_on = 1;   // write-fault tracking must never re-protect driver imports
     if (shadow_on) return shadow_pool(c, r, addr, size);
     if (!c->has_external_memory_host) {
         rt_log("vk: host import requires VK_EXT_external_memory_host; use TOTK_MEMORY=auto and enable shadow storage");
@@ -1259,13 +1260,17 @@ static void mirror_mode(int discrete) {
 #else
     shadow_on = !sh || !*sh || strcmp(sh, "0");
 #endif
+    int fault_shadow = plat_mem_watch_faults();
+    if (fault_shadow) shadow_on = 1;
     if (shadow_on) rt_log("mem: shadow storage: CPU-visible pools are host-visible copies of guest memory, not imports%s",
-                          sh && *sh ? " (TOTK_SHADOW)" : "");
-    rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : "import", why,
-           mode ? "pools used as buffers get a device-local mirror" : "every CPU-visible pool is imported host memory");
+                          fault_shadow ? " (required by page write tracking)" : sh && *sh ? " (TOTK_SHADOW)" : "");
+    rt_log("mem: mode %s (%s): %s", mode == 2 ? "verify" : mode ? "mirror" : shadow_on ? "shadow" : "import", why,
+           mode ? "pools used as buffers get a device-local mirror" : shadow_on
+                    ? "CPU-visible pools use shadow storage without device-local mirrors"
+                    : "every CPU-visible pool is imported host memory");
     // Import is the integrated-GPU mode. On a discrete card every draw reads the pools over PCIe (the comment above
     // this section has the measurements), which is the difference between playable and 5 fps when it is not intended.
-    if (!mode && discrete)
+    if (!mode && discrete && !shadow_on)
         rt_log("mem: warning: import on a discrete GPU: the GPU reads the game's pools over PCIe on every draw, far "
                "slower than mirror (the auto default on a discrete GPU); use memory = auto unless testing");
 }

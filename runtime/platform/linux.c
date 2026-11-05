@@ -919,30 +919,85 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 
 // ---- virtual memory. Reservations are PROT_NONE MAP_NORESERVE mappings; commit is mprotect read-write, decommit
 // MADV_DONTNEED (private anonymous pages read zero afterwards) and PROT_NONE. Linux keeps no committed/reserved
-// distinction, so a byte per guest page records it (pstate, mapped lazily: only the pages touched cost memory).
+// distinction, so primary metadata and a logical-state mirror record it in two bytes per guest page (pstate, mapped
+// lazily: only the pages touched cost memory).
 //
 // Write watch: a userfaultfd in asynchronous write-protect mode (Linux 6.7) over the watched reservations. The kernel
 // clears a page's protection on the first write without a round trip to us, and PAGEMAP_SCAN lists the pages whose
-// protection was cleared and protects them again. Without it (an older kernel), plat_mem_written reports the ranges as
-// untracked and the back end uploads them in full.
+// protection was cleared and protects them again. Older kernels use read-only pages and an owned write-fault handler.
+// Logical permissions and dirty bits survive temporary tracking protection.
 
 #define PG 4096ull
 #define PS_LIMIT (1ull << 39)
 enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW, PS_RX };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
-static uint8_t *pstate;
+static uint8_t *pstate;                 // primary metadata, then a logical-state mirror of the same size; never freed
+static uint64_t ps_version;             // even selects primary, odd selects mirror during a logical-state update
 static int ww_fd = -1, pm_fd = -1;   // userfaultfd and /proc/self/pagemap; -1 when write watch is unavailable
-static PlatMutex vm_lock = PLAT_MUTEX_INIT;
+enum { PS_KIND = 15, PS_WATCH = 16, PS_ASYNC = 32, PS_DIRTY = 64 };
+static int ww_ready;
+static int vm_gate;
+_Static_assert(__atomic_always_lock_free(sizeof vm_gate, 0), "write-fault gate must be lock-free");
+_Static_assert(__atomic_always_lock_free(sizeof ps_version, 0) && __atomic_always_lock_free(1, 0) &&
+               __atomic_always_lock_free(sizeof pstate, 0), "page-state snapshots must be lock-free");
+static int fault_install(void);
 
+// No mutex, allocation or library logging on the fault path. Mask signals before taking the gate so a stopped-thread
+// callback cannot interrupt its owner and recursively wait for it. The handler never holds it while calling a hook.
+static void vm_enter(sigset_t *old) {
+    sigset_t all;
+    sigfillset(&all);
+    sigprocmask(SIG_BLOCK, &all, old);
+    while (__atomic_exchange_n(&vm_gate, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&vm_gate, __ATOMIC_RELAXED)) plat_pause();
+}
+
+static void vm_leave(const sigset_t *old) {
+    __atomic_store_n(&vm_gate, 0, __ATOMIC_RELEASE);
+    sigprocmask(SIG_SETMASK, old, NULL);
+}
+
+static int vm_range(uint64_t addr, uint64_t n) {
+    return n && !(addr & (PG - 1)) && !(n & (PG - 1)) && addr < PS_LIMIT && n <= PS_LIMIT - addr;
+}
+
+// Primary metadata accesses are atomic even under the gate: a snapshot reader may still be finishing an old image.
+static uint8_t ps_load(uint64_t i) { return __atomic_load_n(pstate + i, __ATOMIC_ACQUIRE); }
+static void ps_store(uint64_t i, uint8_t v) { __atomic_store_n(pstate + i, v, __ATOMIC_RELEASE); }
+
+// Gate held. Switch readers to the unchanged mirror before updating primary, then publish primary before repairing
+// the mirror. Neither phase makes readers wait for a writer: a same-thread signal can always read the selected image.
+// Acquire/release byte accesses ensure a reader that sees an overwritten old image also sees the version change.
+static void ps_begin(uint64_t addr) {
+    if (pstate && addr < PS_LIMIT) __atomic_add_fetch(&ps_version, 1, __ATOMIC_SEQ_CST);
+}
+
+static void ps_end(uint64_t addr, uint64_t n) {
+    if (!pstate || addr >= PS_LIMIT) return;
+    __atomic_add_fetch(&ps_version, 1, __ATOMIC_SEQ_CST);
+    uint64_t count = n / PG, available = (PS_LIMIT - addr) / PG;
+    if (count > available) count = available;
+    for (uint64_t i = addr / PG; i < addr / PG + count; i++)
+        __atomic_store_n(pstate + PS_LIMIT / PG + i, ps_load(i) & PS_KIND, __ATOMIC_RELEASE);
+}
+
+// Gate and logical-state update held.
 static void ps_set(uint64_t addr, uint64_t n, uint8_t v) {
-    if (addr < PS_LIMIT) memset(pstate + addr / PG, v, (size_t)((n + PG - 1) / PG));
+    if (pstate && vm_range(addr, n))
+        for (uint64_t i = addr / PG; i < (addr + n) / PG; i++)
+            ps_store(i, (ps_load(i) & (PS_WATCH | PS_ASYNC | PS_DIRTY)) | v);
 }
 
 static void ww_open(void) {
+    if (ww_ready) return;
+    ww_ready = 1;
     int fd = (int)syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
     struct uffdio_api api = {.api = UFFD_API,
                              .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED};
-    if (fd < 0 || ioctl(fd, UFFDIO_API, &api)) {
-        fprintf(stderr, "platform: no asynchronous userfaultfd write protection (%s): written memory is not tracked\n",
+    int failed = fd < 0 || ioctl(fd, UFFDIO_API, &api);
+    uint64_t required = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED;
+    if (!failed && (api.features & required) != required) { errno = ENOTSUP; failed = 1; }
+    if (failed) {
+        fprintf(stderr, "platform: no asynchronous userfaultfd write protection (%s): using page write faults\n",
                 strerror(errno));
         if (fd >= 0) close(fd);
         return;
@@ -955,30 +1010,49 @@ static void ww_open(void) {
     ww_fd = fd;
 }
 
+int plat_mem_watch_faults(void) {
+    sigset_t old;
+    vm_enter(&old);
+    ww_open();
+    int faults = ww_fd < 0;
+    vm_leave(&old);
+    return faults;
+}
+
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
-    plat_mutex_lock(&vm_lock);
+    if (!vm_range(addr, n) || sysconf(_SC_PAGESIZE) != PG) return 0;
+    sigset_t old;
+    vm_enter(&old);
     if (!pstate) {
-        void *p = mmap(NULL, PS_LIMIT / PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        pstate = p == MAP_FAILED ? NULL : p;
+        void *p = mmap(NULL, 2 * (PS_LIMIT / PG), PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p != MAP_FAILED) __atomic_store_n(&pstate, p, __ATOMIC_RELEASE);
     }
     if (watch && ww_fd < 0 && pm_fd < 0) ww_open();
-    void *p = pstate && addr + n <= PS_LIMIT
+    int handler_ok = !watch || ww_fd >= 0 || fault_install();
+    void *p = pstate && handler_ok
                   ? mmap((void *)(uintptr_t)addr, n, PROT_NONE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0)
                   : MAP_FAILED;
     int ok = p == (void *)(uintptr_t)addr;
     if (p != MAP_FAILED && !ok) munmap(p, n);   // a kernel without MAP_FIXED_NOREPLACE put it elsewhere
     if (ok) {
-        ps_set(addr, n, PS_RESERVED);
+        ps_begin(addr);
+        for (uint64_t i = addr / PG; i < (addr + n) / PG; i++)
+            ps_store(i, PS_RESERVED | (watch ? ww_fd < 0 ? PS_WATCH : PS_ASYNC : 0));
         // Transparent huge pages would populate (and count as written) 2 MiB at the first write of one page; writes are
         // tracked per 4 KiB page, as on Windows.
         if (watch) madvise(p, n, MADV_NOHUGEPAGE);
         struct uffdio_register reg = {.range = {addr, n}, .mode = UFFDIO_REGISTER_MODE_WP};
-        if (watch && ww_fd >= 0 && ioctl(ww_fd, UFFDIO_REGISTER, &reg))
-            fprintf(stderr, "platform: write watch over %#llx+%#llx failed (%s)\n", (unsigned long long)addr,
-                    (unsigned long long)n, strerror(errno));
+        if (watch && ww_fd >= 0 && ioctl(ww_fd, UFFDIO_REGISTER, &reg)) {
+            // A failed registration must not masquerade as a clean tracked range.
+            munmap(p, n);
+            for (uint64_t i = addr / PG; i < (addr + n) / PG; i++) ps_store(i, PS_FREE);
+            ok = 0;
+        }
+        ps_end(addr, n);
     }
-    plat_mutex_unlock(&vm_lock);
+    vm_leave(&old);
     return ok;
 }
 
@@ -987,42 +1061,107 @@ void *plat_mem_alloc(size_t n) {
     return p == MAP_FAILED ? NULL : p;
 }
 
+// Gate held. Apply runs with identical tracking protection, not one syscall per clean page on large commits.
+static int vm_protect(uint64_t addr, uint64_t n, int prot) {
+    int native = prot == PLAT_PROT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_PROT_RX ? PROT_READ | PROT_EXEC
+                 : prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
+    ps_begin(addr);
+    int ok = 1;
+    for (uint64_t a = addr; a < addr + n;) {
+        int tracked = pstate && a < PS_LIMIT && (ps_load(a / PG) & PS_WATCH);
+        int p = tracked && prot == PLAT_PROT_RW ? PROT_READ : native;
+        uint64_t b = a + PG;
+        while (b < addr + n && (pstate && b < PS_LIMIT && (ps_load(b / PG) & PS_WATCH) ? 1 : 0) == !!tracked) b += PG;
+        if (mprotect((void *)(uintptr_t)a, b - a, p)) { ok = 0; break; }
+        ps_set(a, b - a, (uint8_t)(PS_NONE + prot));
+        a = b;
+    }
+    ps_end(addr, n);
+    return ok;
+}
+
 int plat_mem_commit(uint64_t addr, size_t n) {
-    if (mprotect((void *)(uintptr_t)addr, n, PROT_READ | PROT_WRITE)) return 0;
-    ps_set(addr, n, PS_RW);
-    return 1;
+    return plat_mem_protect(addr, n, PLAT_PROT_RW);
 }
 
 int plat_mem_decommit(uint64_t addr, uint64_t n) {
-    if (madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED) || mprotect((void *)(uintptr_t)addr, n, PROT_NONE)) return 0;
-    ps_set(addr, n, PS_RESERVED);
-    return 1;
+    if (!n || (addr & (PG - 1)) || (n & (PG - 1)) || n > UINT64_MAX - addr) return 0;
+    sigset_t old;
+    vm_enter(&old);
+    // Revoke access before discarding, and publish RESERVED even when discarding fails: no stale fault may restore RW.
+    ps_begin(addr);
+    int ok = !mprotect((void *)(uintptr_t)addr, n, PROT_NONE);
+    if (ok) {
+        ps_set(addr, n, PS_RESERVED);
+        if (pstate && vm_range(addr, n))
+            for (uint64_t i = addr / PG; i < (addr + n) / PG; i++) ps_store(i, ps_load(i) & ~PS_DIRTY);
+        ok = !madvise((void *)(uintptr_t)addr, n, MADV_DONTNEED);
+    }
+    ps_end(addr, n);
+    vm_leave(&old);
+    return ok;
 }
 
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
-    if (prot < PLAT_PROT_NONE || prot > PLAT_PROT_RX) return 0;
-    int p = prot == PLAT_PROT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_PROT_RX ? PROT_READ | PROT_EXEC
-            : prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
-    if (mprotect((void *)(uintptr_t)addr, n, p)) return 0;
-    ps_set(addr, n, (uint8_t)(PS_NONE + prot));
-    return 1;
+    if (prot < PLAT_PROT_NONE || prot > PLAT_PROT_RX || !n || (addr & (PG - 1)) ||
+        (n & (PG - 1)) || n > UINT64_MAX - addr) return 0;
+    sigset_t old;
+    vm_enter(&old);
+    int ok = vm_protect(addr, n, prot);
+    vm_leave(&old);
+    return ok;
 }
 
 int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
-    if (!pstate || addr >= PS_LIMIT) {
+    uint8_t *state = __atomic_load_n(&pstate, __ATOMIC_ACQUIRE);
+    if (!state || addr >= PS_LIMIT) {
         *end = limit;
         return PLAT_MEM_FREE;
     }
-    uint64_t lim = limit < PS_LIMIT ? limit : PS_LIMIT, i = addr / PG;
-    uint8_t v = pstate[i];
-    while ((i + 1) * PG < lim && pstate[i + 1] == v) i++;
-    *end = (i + 1) * PG < lim ? (i + 1) * PG : lim;
-    return v == PS_FREE ? PLAT_MEM_FREE : v == PS_RESERVED ? PLAT_MEM_RESERVED : v - PS_NONE;
+    for (;;) {
+        uint64_t version = __atomic_load_n(&ps_version, __ATOMIC_ACQUIRE);
+        uint8_t *image = state + (version & 1) * (PS_LIMIT / PG);
+        uint64_t lim = limit < PS_LIMIT ? limit : PS_LIMIT, i = addr / PG;
+        uint8_t v = __atomic_load_n(image + i, __ATOMIC_ACQUIRE) & PS_KIND;
+        while ((i + 1) * PG < lim && (__atomic_load_n(image + i + 1, __ATOMIC_ACQUIRE) & PS_KIND) == v) i++;
+        if (__atomic_load_n(&ps_version, __ATOMIC_ACQUIRE) != version) continue;
+        *end = (i + 1) * PG < lim ? (i + 1) * PG : lim;
+        return v == PS_FREE ? PLAT_MEM_FREE : v == PS_RESERVED ? PLAT_MEM_RESERVED : v - PS_NONE;
+    }
 }
 
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
     if (!max || !n) return 0;
-    if (ww_fd < 0) return UINT64_MAX;
+    if (!vm_range(addr, n)) return UINT64_MAX;
+    sigset_t old;
+    vm_enter(&old);
+    if (!pstate) { vm_leave(&old); return UINT64_MAX; }
+    int mode = ps_load(addr / PG) & (PS_WATCH | PS_ASYNC);
+    for (uint64_t i = addr / PG; i < (addr + n) / PG; i++)
+        if (!mode || (ps_load(i) & (PS_WATCH | PS_ASYNC)) != mode) {
+            vm_leave(&old);
+            return UINT64_MAX;
+        }
+    if (mode == PS_WATCH) {
+        uint64_t got = 0;
+        for (uint64_t a = addr; a < addr + n && got < max; a += PG) {
+            uint8_t s = ps_load(a / PG);
+            if (!(s & PS_DIRTY)) continue;
+            if (reset) {
+                // mprotect completes its TLB shootdown before clearing the bit. A racing write either preceded it
+                // (covered by this answer) or faults after the gate opens (kept for the next answer).
+                if ((s & PS_KIND) == PS_RW && syscall(SYS_mprotect, (void *)(uintptr_t)a, PG, PROT_READ)) {
+                    vm_leave(&old);
+                    return UINT64_MAX;
+                }
+                ps_store(a / PG, s & ~PS_DIRTY);
+            }
+            pages[got++] = a;
+        }
+        vm_leave(&old);
+        return got;
+    }
+    vm_leave(&old);
     struct page_region r[256];
     uint64_t got = 0;
     for (uint64_t at = addr, end = addr + n; at < end && got < max;) {
@@ -1054,9 +1193,30 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
 static int (*fault_hook)(uint64_t addr);
 static void (*crash_fn)(const PlatCrash *c);
 
+static int watch_fault(uint64_t addr) {
+    if (addr >= PS_LIMIT) return 0;
+    int saved = errno, handled = 0;
+    sigset_t old;
+    vm_enter(&old);
+    if (pstate && (ps_load(addr / PG) & (PS_WATCH | PS_KIND)) == (PS_WATCH | PS_RW)) {
+        ps_store(addr / PG, ps_load(addr / PG) | PS_DIRTY);
+        if (syscall(SYS_mprotect, (void *)(uintptr_t)(addr & ~(PG - 1)), PG, PROT_READ | PROT_WRITE)) {
+            static const char msg[] = "platform: write tracking mprotect failed\n";
+            write(STDERR_FILENO, msg, sizeof msg - 1);
+            _exit(70);
+        }
+        handled = 1;
+    }
+    vm_leave(&old);
+    errno = saved;
+    return handled;
+}
+
 static void fault_handler(int sig, siginfo_t *si, void *uc) {
     ucontext_t *u = uc;
     int access = context_access(u);
+    if (sig == SIGSEGV && si->si_code == SEGV_ACCERR && access == 1 &&
+        watch_fault((uint64_t)(uintptr_t)si->si_addr)) return;
     if (sig == SIGSEGV && fault_hook && access == 1 && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
     uintptr_t rip = (uintptr_t)context_pc(u);
     Dl_info at, self;
@@ -1078,17 +1238,21 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
     signal(sig, SIG_DFL);   // returns into the faulting instruction, which faults again with the default action
 }
 
-static void fault_install(void) {
-    static int done;
-    if (done) return;
-    done = 1;
-    alt_stack();
+static int fault_ready;
+static void fault_install_once(void) {
     struct sigaction sa = {.sa_sigaction = fault_handler, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER};
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGILL, &sa, NULL);
-    sigaction(SIGFPE, &sa, NULL);
+    fault_ready = !sigaction(SIGSEGV, &sa, NULL);
+    if (sigaction(SIGBUS, &sa, NULL)) fault_ready = 0;
+    if (sigaction(SIGILL, &sa, NULL)) fault_ready = 0;
+    if (sigaction(SIGFPE, &sa, NULL)) fault_ready = 0;
+}
+
+static int fault_install(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    alt_stack();
+    pthread_once(&once, fault_install_once);
+    return fault_ready;
 }
 
 void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
@@ -1161,10 +1325,89 @@ void plat_file_close(PlatFile *f) {
     if (f) close(fd_of(f));
 }
 
+// Only used for unowned portions of a destination crossing a watched reservation. As with ordinary pread, the
+// caller must keep the destination alive; a /proc snapshot is not a concurrent-unmap lifetime guarantee.
+static int file_native_writable(uint64_t lo, uint64_t hi) {
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return 0;
+    char line[512], perm[5];
+    unsigned long long a, b;
+    while (lo < hi && fgets(line, sizeof line, f)) {
+        if (sscanf(line, "%llx-%llx %4s", &a, &b, perm) != 3 || b <= lo) continue;
+        if (a > lo || perm[1] != 'w') break;
+        lo = b < hi ? b : hi;
+    }
+    fclose(f);
+    return lo == hi;
+}
+
+static uint8_t file_page_state(uint64_t a) {
+    return pstate && a < PS_LIMIT ? ps_load(a / PG) : 0;
+}
+
 int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
+    uint64_t lo = (uintptr_t)buf, end;
+    if (n > UINT64_MAX - lo) { errno = EFAULT; return -2; }
+    end = lo + n;
+    sigset_t old;
+    vm_enter(&old);
+    int bounce = 0;
+    for (uint64_t a = lo & ~(PG - 1); a < end && n; a += PG) {
+        if (file_page_state(a) & PS_WATCH) { bounce = 1; break; }
+        if (a > UINT64_MAX - PG) break;
+    }
+    vm_leave(&old);
+    void *allocation = NULL, *dst = buf;
+    if (bounce) {
+        size_t align = PG;
+#ifdef STATX_DIOALIGN
+        struct statx stx;
+        if (!statx(fd_of(f), "", AT_EMPTY_PATH, STATX_DIOALIGN, &stx) &&
+            (stx.stx_mask & STATX_DIOALIGN) && stx.stx_dio_mem_align > align)
+            align = stx.stx_dio_mem_align;
+#endif
+        // Keep the original pointer's alignment residue: bouncing must not make an invalid O_DIRECT request valid.
+        if ((align & (align - 1)) || (size_t)n > SIZE_MAX - align) { errno = EINVAL; return -1; }
+        int e = posix_memalign(&allocation, align, (size_t)n + align);
+        if (e) { errno = e; return -1; }
+        dst = (uint8_t *)allocation + (lo & (align - 1));
+    }
     ssize_t k;
-    do k = pread(fd_of(f), buf, n, (off_t)off);
+    do k = pread(fd_of(f), dst, n, (off_t)off);
     while (k < 0 && errno == EINTR);
+    if (bounce && k > 0) {
+        end = lo + (uint64_t)k;
+        // Thaw frozen logical READ pages through the existing hook, outside the tracking gate. Validate the whole
+        // returned span before modifying any destination bytes; RX, NONE and decommitted pages are never thawed here.
+        for (uint64_t a = lo & ~(PG - 1); a < end; a += PG) {
+            vm_enter(&old);
+            uint8_t s = file_page_state(a);
+            vm_leave(&old);
+            if ((s & PS_WATCH) && (s & PS_KIND) == PS_READ && fault_hook) fault_hook(a < lo ? lo : a);
+        }
+        // Keep native permission validation and copy under the same gate as plat_mem_protect, including addresses
+        // above PS_LIMIT that have no logical metadata. This still does not pin mappings against external unmaps.
+        int valid = 1;
+        vm_enter(&old);
+        for (uint64_t a = lo & ~(PG - 1); a < end && valid; a += PG) {
+            uint8_t s = file_page_state(a);
+            if (s & PS_KIND) valid = (s & PS_KIND) == PS_RW;
+            else valid = file_native_writable(a < lo ? lo : a, a + PG < end ? a + PG : end);
+        }
+        if (valid) {
+            for (uint64_t a = lo & ~(PG - 1); a < end; a += PG) {
+                if (!(file_page_state(a) & PS_WATCH)) continue;
+                if (syscall(SYS_mprotect, (void *)(uintptr_t)a, PG, PROT_READ | PROT_WRITE)) { valid = 0; break; }
+                ps_store(a / PG, ps_load(a / PG) | PS_DIRTY);
+            }
+            if (valid) memcpy(buf, dst, (size_t)k);
+        }
+        vm_leave(&old);
+        if (!valid) { errno = EFAULT; k = -1; }
+    }
+    int e = errno;
+    free(allocation);
+    errno = e;
     return k >= 0 ? k : errno == EFAULT ? -2 : -1;
 }
 

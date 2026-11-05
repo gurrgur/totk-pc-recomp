@@ -226,6 +226,8 @@ int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end);
 // The pages of a watched reservation written since the last reset, up to max page addresses into pages, in address
 // order; reset: those reported start over as unwritten. UINT64_MAX when writes to the range are not tracked.
 uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset);
+// Nonzero when write watch uses CPU page faults: guest storage must have explicit GPU shadow backing, not imports.
+int plat_mem_watch_faults(void);
 // A write that faulted on a read-only page at addr goes to fn first; fn returns 1 when it made the page writable and
 // the write should run again, 0 to let the fault go on (to the crash handler). One hook per process.
 void plat_mem_fault_hook(int (*fn)(uint64_t addr));

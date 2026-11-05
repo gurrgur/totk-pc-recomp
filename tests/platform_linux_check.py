@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TESTS = ['platform_linux_check']
+TESTS = ['platform_linux_check', 'linux_watch_check', 'linux_watch_state_check']
 
 
 def main():

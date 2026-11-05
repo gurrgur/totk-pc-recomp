@@ -612,6 +612,8 @@ uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t m
     return got;
 }
 
+int plat_mem_watch_faults(void) { return 0; }
+
 static int (*fault_hook)(uint64_t addr);
 
 // A write access violation (ExceptionInformation[0] == 1) goes to the hook; registered first, before the crash handler.

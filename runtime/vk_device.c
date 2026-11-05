@@ -181,6 +181,8 @@ static const char *missing_required(VkPhysicalDevice pd) {
     const char *miss = NULL;
     for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext && !miss; i++) {
         if (has_ext(e, n, k_required_ext[i])) continue;
+        // Fault tracking requires shadow storage regardless of import settings, so no guest memory is imported.
+        if (!strcmp(k_required_ext[i], VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) && plat_mem_watch_faults()) continue;
 #if defined(__linux__) && defined(__aarch64__)
         if (!strcmp(k_required_ext[i], VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
             const char *mode = cfg_value("TOTK_MEMORY"), *shadow = cfg_get("TOTK_SHADOW");
