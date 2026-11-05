@@ -191,10 +191,14 @@ static int ts_open(VkCommandBuffer cb) {
     return (int)p;
 }
 
-// At its end, before vkEndCommandBuffer; fence: the value whose completion covers it.
-static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence) {
+// At its end, before vkEndCommandBuffer; register the read separately in GPU submission order.
+static void ts_close(VkCommandBuffer cb, int pair) {
     if (pair < 0) return;
     vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool, 2 * (uint32_t)pair + 1);
+}
+
+static void ts_enqueue(int pair, uint64_t fence) {
+    if (pair < 0) return;
     ts_sub_ns[pair] = 0;
     if (ts_n_unsent < 4) ts_unsent[ts_n_unsent++] = pair;
     TsRead *t = malloc(sizeof *t);
@@ -206,9 +210,11 @@ static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence) {
 // The pair of the part being recorded.
 static void ts_begin(VkCommandBuffer cb) { ts_cur = ts_open(cb); }
 
-static void ts_end(VkCommandBuffer cb, uint64_t fence) {
-    ts_close(cb, ts_cur, fence);
+static int ts_end(VkCommandBuffer cb) {
+    int pair = ts_cur;
+    ts_close(cb, pair);
     ts_cur = -1;
+    return pair;
 }
 
 // An empty submission records no command buffer: its pair is never written.
@@ -357,7 +363,8 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
     rec_begin(cb, fence, 0, 0);   // a command buffer of the part pool: the recorder's like the parts
     int pair = ts_open(cb);
     vk_mem_mirror_prologue(cb);
-    ts_close(cb, pair, fence);
+    ts_close(cb, pair);
+    ts_enqueue(pair, fence);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);
     return cb;
 }
@@ -365,10 +372,11 @@ static VkCommandBuffer prologue(VkCtx *c, uint64_t fence) {
 VkCommandBuffer vk_sync_split(void) {
     VkCtx *c = vk_ctx();
     VkCommandBuffer cb = slots[cur_slot].cb;
-    ts_end(cb, cur_fence);
+    int pair = ts_end(cb);
     if (!rec_end_cb(cb, 0, 0)) vkEndCommandBuffer(cb);   // every command of the part is in cb, ended by its recorder
     vk_upload_flush(0);   // the uploads this part asked for precede it in queue order
     VkCommandBuffer pro = prologue(c, cur_fence);
+    ts_enqueue(pair, cur_fence);   // the prologue runs first, so its timestamps must be read first
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = cb}};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = pro ? 2 : 1,
@@ -412,7 +420,8 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     ts_begin(s->cb);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
-    if (recorded) ts_end(s->cb, fence);
+    int pair = -1;
+    if (recorded) pair = ts_end(s->cb);
     else ts_drop();
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
     if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
@@ -420,6 +429,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
     vk_upload_flush(0);
     VkCommandBuffer pro = prologue(c, fence);
+    ts_enqueue(pair, fence);   // match the prologue-before-main GPU submission order
     s = &slots[cur_slot];
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
