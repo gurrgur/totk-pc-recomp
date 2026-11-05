@@ -40,6 +40,23 @@ def layout(exefs):
     return out
 
 
+def nce_arenas(mods, sizes):
+    """Near code lives in existing module slots; original bases never move."""
+    out = []
+    before = mods[0][1]
+    for i, (name, base, size) in enumerate(mods):
+        start = align_up(base + size + (0x1000 if name == 'main' else 0), 0x1000)
+        end = mods[i + 1][1] if i + 1 < len(mods) else 0x7010000000
+        length = align_up(sizes.get(name, 0), 0x1000)
+        if start + length > end:
+            start = before - length
+            before = start
+        if start < 0x100000000 or start + length > ADDRESS_LIMIT or max(abs(start - base - size), abs(start + length - base)) >= (1 << 27):
+            raise ValueError(f'{name}: no collision-free near arena for {length:#x} bytes')
+        out.append((name, start, length))
+    return out
+
+
 def write(mods, outdir):
     """layout.json for Python tools and layout.h for the runtime."""
     outdir = Path(outdir)

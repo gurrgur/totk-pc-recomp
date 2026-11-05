@@ -11,6 +11,7 @@
 // locks or per-thread caches. Host (HLE) functions at addresses outside the modules live in a small hash table that
 // is also fixed at init; they are looked up only after the flat table misses.
 #include "dispatch.h"
+#include "nce.h"
 #include "host.h"
 #include "platform/platform.h"
 
@@ -91,6 +92,9 @@ void rt_register_host(uint64_t addr, GuestFn fn) {
     g_host[h].addr = addr;
     g_host[h].fn = fn;
     g_nhost++;
+#if RT_NCE
+    rt_nce_register_host(addr);
+#endif
 }
 
 static void *table_alloc(uint64_t bytes) {
@@ -114,6 +118,12 @@ void rt_dispatch_init(const RtModule *mods, int count) {
     for (int i = 1; i < g_nmods; i++)
         if (g_mods[i - 1]->base + g_mods[i - 1]->size > g_mods[i]->base)
             rt_fatal("dispatch: modules %s and %s overlap", g_mods[i - 1]->name, g_mods[i]->name);
+
+#if RT_NCE
+    __atomic_store_n(&g_ready, true, __ATOMIC_RELEASE);
+    rt_nce_publish();
+    return;
+#endif
 
     // Function tables: sorted, aligned, inside their module. Range of guest starts and of host functions.
     uint64_t lo = UINT64_MAX, hi = 0;
@@ -172,9 +182,14 @@ void rt_dispatch_init(const RtModule *mods, int count) {
 }
 
 GuestFn rt_dispatch_lookup(uint64_t pc) {
+#if RT_NCE
+    if (rt_nce_original_pc(pc)) return rt_nce_call;
+    return g_ready ? host_lookup(pc) : NULL;
+#else
     uint64_t i = __builtin_rotateright64(pc - D.lo, 2);   // a misaligned pc lands far above D.slots
     if (i < D.slots && D.slot[i]) return (GuestFn)(D.anchor + D.slot[i]);
     return g_ready ? host_lookup(pc) : NULL;
+#endif
 }
 
 __attribute__((noinline, noreturn, cold)) static void dispatch_fail(Cpu *c) {
@@ -205,6 +220,12 @@ static __attribute__((noinline)) void dispatch_preempt(Cpu *c) {
 // Jump to the guest address in c->pc. Always a tail call, so chains of indirect jumps keep the host stack flat. A
 // pending preempt request costs two loads and a branch to check.
 void rt_dispatch(Cpu *c) {
+#if RT_NCE
+    if (c->thread && kern_preempt_pending(c->thread)) kern_checkpoint();
+    GuestFn native = rt_dispatch_lookup(c->pc);
+    if (!native) dispatch_fail(c);
+    native(c);
+#else
     if (__builtin_expect(c->thread && kern_preempt_pending(c->thread), 0))
         __attribute__((musttail)) return dispatch_preempt(c);
     uint64_t i = __builtin_rotateright64(c->pc - D.lo, 2);
@@ -212,6 +233,7 @@ void rt_dispatch(Cpu *c) {
     if (__builtin_expect(!off, 0)) __attribute__((musttail)) return dispatch_slow(c);
     GuestFn f = (GuestFn)(D.anchor + off);
     __attribute__((musttail)) return f(c);
+#endif
 }
 
 RtDispatchStats rt_dispatch_stats(void) {

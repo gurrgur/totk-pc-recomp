@@ -32,9 +32,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import lz4.block
+from build_xlate import build_dir, default_target
 
 ROOT = Path(__file__).resolve().parent.parent
-XLATE = ROOT / 'build' / 'xlate' / ('totk_xlate.exe' if os.name == 'nt' else 'totk_xlate')
+XLATE = build_dir(default_target()) / ('totk_xlate.exe' if os.name == 'nt' else 'totk_xlate')
 SPIRV_VAL = Path(r'C:\msys64\ucrt64\bin\spirv-val.exe') if os.name == 'nt' else Path(shutil.which('spirv-val') or '/usr/bin/spirv-val')
 ZSTD = b'\x28\xb5\x2f\xfd'
 # NVN program control section magic, u32 0x98761234 (d2r-mobile dm/gfx/tools/shader_map.py)

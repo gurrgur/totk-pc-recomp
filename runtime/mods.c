@@ -79,7 +79,11 @@ static int exefs_cb(const char *name, int kind, uint64_t size, void *ctx) {
     int *k = ctx;
     if (kind != PLAT_FS_FILE) return 1;
     if (ends_with_ci(name, ".ips") || ends_with_ci(name, ".pchtxt")) *k |= MOD_EXEFS;
-    else if (!strncasecmp(name, "subsdk", 6) || !strcasecmp(name, "main")) *k |= MOD_SUBSDK;
+    else if (!strncasecmp(name, "subsdk", 6) || !strcasecmp(name, "main")
+#if RT_NCE
+             || !strcasecmp(name, "sdk") || !strcasecmp(name, "rtld")
+#endif
+             ) *k |= MOD_SUBSDK;
     return 1;
 }
 
@@ -337,6 +341,13 @@ static int scan_cb(const char *name, int kind, uint64_t size, void *ctx) {
     if (m->exefs[0]) plat_fs_list(m->exefs, exefs_cb, &m->kind);
     if (m->cheats[0]) plat_fs_list(m->cheats, cheats_cb, &m->kind);
     int unsupported = exefs_check(m, path);
+#if RT_NCE
+    if (m->kind & (MOD_EXEFS | MOD_CHEATS)) {
+        unsupported = 1;
+        m->pending = 0;
+        snprintf(m->note, sizeof m->note, "native executable mods/cheats are unsupported; the whole mod stays off");
+    }
+#endif
     // a mod whose code part the port cannot use is off as a whole: its RomFS files may expect that code
     m->problem = strchr(m->name, '|')                                       ? MOD_BAD_NAME
                : m->kind & MOD_SUBSDK                                       ? MOD_PLUGIN

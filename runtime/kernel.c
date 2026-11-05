@@ -15,6 +15,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "kernel.h"
+#include "nce.h"
 #include "platform/platform.h"
 
 #define R_OK 0u
@@ -362,6 +363,15 @@ static void ap_init(void) {
     g_ap = strcmp(e, "0") != 0;
     g_ap_int = g_ap && strcmp(e, "2") != 0;
     if (g_ap) {
+#if RT_NCE
+        g_gen_lo = UINTPTR_MAX;
+        for (unsigned i = 0; i < rt_nce_module_count; i++) {
+            const NceModule *m = &rt_nce_modules[i];
+            if (m->base + m->text_offset < g_gen_lo) g_gen_lo = m->base + m->text_offset;
+            if (m->base + m->text_offset + m->text_size > g_gen_hi) g_gen_hi = m->base + m->text_offset + m->text_size;
+        }
+        kern_host_track = 1;
+#else
         RtModule m[16];
         int n = rt_linked_modules(m, 16);
         uintptr_t lo = UINTPTR_MAX, hi = 0;
@@ -384,11 +394,17 @@ static void ap_init(void) {
             g_gen_hi = hi;
             kern_host_track = 1;
         }
+#endif
     }
+#if RT_NCE
+    rt_log("kernel: asynchronous preemption %s, priority inheritance/preemption disable %s; native text %#llx-%#llx",
+           g_ap_int ? "on" : "off", g_ap ? "on" : "off", (unsigned long long)g_gen_lo, (unsigned long long)g_gen_hi);
+#else
     rt_log("kernel: asynchronous preemption of virtual cores %s, priority inheritance and preemption disable %s; lifted "
            "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (TOTK_ASYNC_PREEMPT=0 turns all off)" : "off",
            (unsigned long long)(g_gen_lo ? g_gen_lo - plat_exe_base() : 0),
            (unsigned long long)(g_gen_hi ? g_gen_hi - plat_exe_base() : 0));
+#endif
 }
 
 // Horizon's priority inheritance: o counts at the priority of the best thread blocked on a guest mutex it owns (the
@@ -418,6 +434,7 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 // An x86-64-v2 build (no __AVX__) saves XMM0-15 with SSE moves into the same 32-byte slots instead: its game code
 // keeps nothing in the upper YMM halves, and the CPUs it is for have no VEX encoding, so a vmovdqa there faults with
 // an illegal instruction the first time a core is interrupted.
+#if !RT_NCE
 #ifdef __AVX__
 #define AP_VMOV "vmovdqa"
 #define AP_V "%ymm"
@@ -597,6 +614,8 @@ __asm__(".text\n"
         ".size kern_ap_stub, .-kern_ap_stub\n");
 #endif
 
+#endif
+
 enum { AP_NONE, AP_RETRY, AP_SENT };
 
 // The waiter w interrupts its target owner if that runs top-level game code (holding G; the owner is stopped only
@@ -625,7 +644,11 @@ static int ap_try(RtThread *w) {
     }
     int r = AP_RETRY;
     uint64_t to = 0;
+#if RT_NCE
+    if (!rt_nce_original_pc(rip) || o->cur_core < 0 || g_core_owner[o->cur_core] != o || !o->preempt)
+#else
     if (rip < g_gen_lo || rip > g_gen_hi)
+#endif
         g_ap_pc++;
     else if (__atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0)
         g_ap_host++;
@@ -635,19 +658,37 @@ static int ap_try(RtThread *w) {
     } else {
         o->ap_rip = rip;
         o->ap_pending = 1;
+#if RT_NCE
+        to = (uint64_t)(uintptr_t)rt_nce_preempt;
+#else
         to = (uint64_t)(uintptr_t)kern_ap_stub;
+#endif
     }
-    if (!plat_intr_resume(o->hthr, to)) {
+#if RT_NCE
+    int resumed = to ? plat_intr_resume_callback(o->hthr, rt_nce_preempt, o->cur) : plat_intr_resume(o->hthr, 0);
+#else
+    int resumed = plat_intr_resume(o->hthr, to);
+#endif
+    if (!resumed) {
         o->ap_pending = 0;
         g_ap_fail++;
     } else if (to) {
         g_ap_sent++;
         r = AP_SENT;
     }
-    if (r == AP_SENT && g_ap_log < AP_LOG_N) {
+    if (r == AP_SENT && g_ap_log < AP_LOG_N
+#if RT_NCE
+        && (!tcur || !tcur->ap_pending)
+#endif
+        ) {
         g_ap_log++;
+#if RT_NCE
+        rt_log("kernel: interrupt %#x p%d at native pc %#llx sp %#llx for %#x p%d", o->handle, o->prio,
+               (unsigned long long)o->ap_rip, (unsigned long long)rsp, w->handle, w->prio);
+#else
         rt_log("kernel: interrupt %#x p%d at exe+%#llx rsp %#llx for %#x p%d", o->handle, o->prio,
                (unsigned long long)(o->ap_rip - plat_exe_base()), (unsigned long long)rsp, w->handle, w->prio);
+#endif
     }
     return r;
 }
@@ -996,7 +1037,11 @@ static void core_take(RtThread *t) {
     while (t->cur_core < 0) {
         uint32_t ms = 0;   // 0: until signalled
         if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
-        int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST);
+        int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST)
+#if RT_NCE
+                     && !t->ap_pending
+#endif
+                     ;
         if (sample && !ms) ms = 2;
         if (ms) plat_cond_wait_ms(&t->cv, &G, ms);
         else plat_cond_wait(&t->cv, &G);
@@ -1005,7 +1050,11 @@ static void core_take(RtThread *t) {
             dg_sample(t);
         }
     }
-    if (g_diag > 0) dg_done(t);
+    if (g_diag > 0
+#if RT_NCE
+        && !t->ap_pending
+#endif
+        ) dg_done(t);
     if (t->grant_at) {
         uint64_t d = kern_now_ns() - t->grant_at;
         t->lg_ns += d;
@@ -1127,7 +1176,9 @@ uint64_t kern_ap_rip(void) { return tcur->ap_rip; }
 void kern_ap_yield(void) {
     RtThread *t = tcur;
     lock();
+#if !RT_NCE
     t->ap_pending = 0;
+#endif
     if (t->preempt && t->cur_core >= 0 && !ap_disabled(t) && core_better_waiter(t, t->cur_core)) {
         if (g_diag > 0) {
             t->dg_pc = t->cur->pc;
@@ -1137,6 +1188,9 @@ void kern_ap_yield(void) {
         core_put(t);
         core_take(t);
     }
+#if RT_NCE
+    t->ap_pending = 0;
+#endif
     unlock();
 }
 
@@ -1442,6 +1496,9 @@ static void thr_free(RtThread *t) {   // holding G; t has exited and its handle 
 // The end of every guest thread, on its own host context after the unwind: give the core up, signal the thread
 // object, free it if its handle is already closed. t is not touched after the unlock.
 static void thread_finish(RtThread *t) {
+#if RT_NCE
+    rt_nce_cleanup(t->cpu);
+#endif
     if (t->base_fiber) plat_fiber_unself();
     t->base_fiber = NULL;
     tcur = NULL;
@@ -1476,6 +1533,9 @@ static void thread_main(void *p) {
     PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
+#if RT_NCE
+    plat_cond_wait_ns(&t->cv, &G, 1); // Allocate the wait primitive before any signal-side scheduling.
+#endif
     while (!t->started) plat_cond_wait(&t->cv, &G);
     core_take(t);
     unlock();
@@ -1521,6 +1581,9 @@ uint32_t kern_main_thread(Cpu **cpu) {
     PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
+#if RT_NCE
+    plat_cond_wait_ns(&t->cv, &G, 1);
+#endif
     thr_link(t);
     g_main = t;
     g_main_stack = stack;
@@ -2173,8 +2236,21 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to);
 // After a host fiber switch: release the context left behind, and finish an ExitThread issued on a fiber.
 static void fiber_resumed(void) {
     RtThread *t = tcur;
+#if RT_NCE
+    rt_set_fpcr(0);
+    rt_set_fpsr(0);
+    rt_nce_bind(t->cur);
+#else
     rt_fpcr_sync(t->cur);   // the host fiber resumes with its own MXCSR (platform.h fibers switch it)
+#endif
     if (t->leaving) {
+#if RT_NCE
+        if (t->exit_pending) {
+            t->leaving->state = F_DONE;
+            rt_nce_cleanup(t->leaving->cpu);
+            rt_nce_bind(t->cur);
+        }
+#endif
         __atomic_store_n(&t->leaving->running, 0, __ATOMIC_RELEASE);
         t->leaving = NULL;
     }
@@ -2203,10 +2279,11 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     }
     Cpu *dst = to ? to->cpu : t->cpu;
     if (to) {
-        if (to->state == F_DONE) rt_fatal("SwitchToFiber(%#llx): the fiber has finished", (unsigned long long)to->addr);
         int idle = 0;
         if (!__atomic_compare_exchange_n(&to->running, &idle, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             rt_fatal("SwitchToFiber(%#llx): the fiber is running", (unsigned long long)to->addr);
+        // The acquire publishes the previous owner's final state before any abandoned stack can be resumed.
+        if (to->state == F_DONE) rt_fatal("SwitchToFiber(%#llx): the fiber has finished", (unsigned long long)to->addr);
         if (to->state == F_NEW) {
             dst->sp = (to->stack + to->size) & ~15ull;
             to->state = F_STARTED;
@@ -2223,6 +2300,9 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     t->cur = dst;
     int depth = t->host_depth;
     plat_fiber_switch(to ? to->host : t->base_fiber);
+#if RT_NCE
+    t = tcur;
+#endif
     t->host_depth = depth;
     fiber_resumed();
 }
@@ -2244,6 +2324,10 @@ void kern_fiber_initialize(Cpu *c) {
         g_fibers[i] = f;
         plat_mutex_unlock(&g_fiber_lock);
     } else if (f->host) {
+#if RT_NCE
+        rt_nce_cleanup(f->cpu);
+        rt_nce_bind(tcur->cur);
+#endif
         plat_fiber_free(f->host);
     }
     memset(f->cpu, 0, sizeof *f->cpu);
@@ -2272,6 +2356,10 @@ void kern_fiber_finalize(Cpu *c) {
     plat_mutex_unlock(&g_fiber_lock);
     if (!f) rt_fatal("FinalizeFiber(%#llx): not an initialized fiber", (unsigned long long)addr);
     if (f->running) rt_fatal("FinalizeFiber(%#llx): the fiber is running", (unsigned long long)addr);
+#if RT_NCE
+    rt_nce_cleanup(f->cpu);
+    rt_nce_bind(tcur->cur);
+#endif
     plat_fiber_free(f->host);
     plat_aligned_free(f->cpu);
     free(f);

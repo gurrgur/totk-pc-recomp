@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "host.h"
+#include "nce.h"
 
 #define MAX_HOSTFN 4096   // dispatch.c holds HOST_CAP / 2 host functions
 #define MAX_ADDED 64
@@ -142,6 +143,10 @@ __attribute__((noinline)) static void hostfn_tracked(Cpu *c, GuestFn fn) {
     int *d = kern_host_depth(t);
     __atomic_store_n(d, *d + 1, __ATOMIC_RELAXED);
     fn(c);
+#if RT_NCE
+    t = c->thread;
+    d = kern_host_depth(t);
+#endif
     int n = *d - 1;
     __atomic_store_n(d, n, __ATOMIC_RELAXED);
     if (!n && kern_preempt_pending(t)) kern_host_left(t);
@@ -227,7 +232,9 @@ uint64_t rt_call(Cpu *c, uint64_t fn, int n, ...) {
     uint64_t lr = c->x[30], pc = c->pc;
     c->x[30] = RT_RET_HOST;
     c->pc = fn;
+#if !RT_NCE
     rt_fpcr_sync(c);   // guest code may start here on a host thread or fiber that has not run it
+#endif
     rt_dispatch(c);
     c->x[30] = lr;
     c->pc = pc;

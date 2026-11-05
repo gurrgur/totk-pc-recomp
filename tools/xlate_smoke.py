@@ -16,8 +16,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+from build_xlate import build_dir, default_target
+
 ROOT = Path(__file__).resolve().parent.parent
-EXE = ROOT / "build" / "xlate" / ("totk_xlate.exe" if os.name == "nt" else "totk_xlate")
+EXE = build_dir(default_target()) / ("totk_xlate.exe" if os.name == "nt" else "totk_xlate")
 SPIRV_VAL = (Path(r"C:\msys64\ucrt64\bin\spirv-val.exe") if os.name == "nt"
              else Path(shutil.which("spirv-val") or "/usr/bin/spirv-val"))
 

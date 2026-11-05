@@ -276,8 +276,12 @@ static void xlate_identity(void) {
            xlate_id[3], xlate_id[4], xlate_id[5], xlate_id[6], xlate_id[7], how);
 }
 
-// The repository root is the nearest parent of totk.exe that holds build/xlate/totk_xlate.exe. The shader cache lives
-// next to totk.exe, so every build dir has its own (as the pipeline cache, vk_pipeline.c cache_path_init).
+// The repository root holds the target's translator build. The shader cache lives next to totk.exe.
+#if defined(__aarch64__)
+#define XLATE_BUILD_DIR "xlate-aarch64"
+#else
+#define XLATE_BUILD_DIR "xlate"
+#endif
 static void use_preload_start(void);
 
 static void init_paths(void *param) {
@@ -289,7 +293,7 @@ static void init_paths(void *param) {
         for (char *cut = plat_last_sep(exe); cut; cut = plat_last_sep(exe)) {
             *cut = 0;
             char probe[PATH_CAP + 32];
-            snprintf(probe, sizeof probe, "%s/build/xlate/totk_xlate" PLAT_EXE_SUFFIX, exe);
+            snprintf(probe, sizeof probe, "%s/build/" XLATE_BUILD_DIR "/totk_xlate" PLAT_EXE_SUFFIX, exe);
             if (file_exists(probe)) {
                 strcpy(root, exe);
                 break;
@@ -301,7 +305,7 @@ static void init_paths(void *param) {
     if (exe_dir[0]) snprintf(beside, sizeof beside, "%s/totk_xlate" PLAT_EXE_SUFFIX, exe_dir);
     if (xlate_cfg && *xlate_cfg && strlen(xlate_cfg) < sizeof xlate_exe) strcpy(xlate_exe, xlate_cfg);
     else if (exe_dir[0] && file_exists(beside)) strcpy(xlate_exe, beside);
-    else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/build/xlate/totk_xlate" PLAT_EXE_SUFFIX, root);
+    else if (root[0]) snprintf(xlate_exe, sizeof xlate_exe, "%s/build/" XLATE_BUILD_DIR "/totk_xlate" PLAT_EXE_SUFFIX, root);
     if (cache_cfg && *cache_cfg && strlen(cache_cfg) < sizeof cache_dir) strcpy(cache_dir, cache_cfg);
     else if (exe_dir[0]) snprintf(cache_dir, sizeof cache_dir, "%s/shader-cache", exe_dir);
     xlate_identity();

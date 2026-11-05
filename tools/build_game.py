@@ -1,4 +1,4 @@
-"""Compile the generated C for one game version and link it with the runtime into build/<version>/totk.exe.
+"""Build lifted C on x86-64, or native guest execution on Linux AArch64, with the runtime.
 
 Writes build/<version>/build.ninja and runs MSYS2 UCRT64 Ninja on it. Ninja keeps the build incremental: a chunk is
 recompiled only when it, a header it includes or its flags change.
@@ -61,6 +61,7 @@ import ctypes.wintypes as wt   # the job-object structures below; importing it w
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -102,13 +103,41 @@ GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-lab
 RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
 
 
-def set_cpu(cpu):
-    """Target x86-64-v3 (the default) or x86-64-v2. RT_CPU_LEVEL lets runtime/main.c's self-test check the same
-    instruction set the build was compiled for."""
-    march = f'-march=x86-64-{cpu}'
-    GEN_FLAGS[GEN_FLAGS.index('-march=x86-64-v3')] = march
-    RT_FLAGS[RT_FLAGS.index('-march=x86-64-v3')] = march
-    RT_FLAGS.append(f'-DRT_CPU_LEVEL={3 if cpu == "v3" else 2}')
+TARGET = 'x86_64'
+
+
+def default_target():
+    if WIN:
+        return 'x86_64'
+    machine = platform.machine().lower()
+    if machine in ('aarch64', 'arm64'):
+        return 'aarch64'
+    if machine in ('x86_64', 'amd64'):
+        return 'x86_64'
+    sys.exit(f'unsupported host architecture: {machine}')
+
+
+def set_target(target, cpu=None):
+    global TARGET
+    if target == 'aarch64':
+        if WIN:
+            sys.exit('Windows supports only --target x86_64')
+        if cpu:
+            sys.exit('--cpu is only valid with --target x86_64')
+        GEN_FLAGS.remove('-march=x86-64-v3')
+        RT_FLAGS.remove('-march=x86-64-v3')
+    else:
+        march = f'-march=x86-64-{cpu or "v3"}'
+        GEN_FLAGS[GEN_FLAGS.index('-march=x86-64-v3')] = march
+        RT_FLAGS[RT_FLAGS.index('-march=x86-64-v3')] = march
+        RT_FLAGS.append(f'-DRT_CPU_LEVEL={2 if cpu == "v2" else 3}')
+    TARGET = target
+    RT_FLAGS.append(f'-DRT_NCE={int(target == "aarch64")}')
+    if not WIN and target != default_target():
+        triple = f'--target={target}-linux-gnu'
+        GEN_FLAGS.insert(0, triple)
+        RT_FLAGS.insert(0, triple)
+        LINK_FLAGS.insert(0, triple)
 
 
 # Profile-guided optimisation (--pgo). Both modes compile the generated code at -O2, the level the profile's inlining and
@@ -320,6 +349,8 @@ def runtime_sources(skip=()):
     names in skip, so a task adds a file without editing this script."""
     pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
             'third_party/imgui/backends/*.cpp')
+    if TARGET == 'aarch64':
+        pats += ('*.S',)
     return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip and not other_os(p.name))
 
 
@@ -347,14 +378,14 @@ def runtime_object(out, src):
     """obj/runtime/<path below runtime>.o, so platform/win32.c cannot collide with a top-level win32.c."""
     src = Path(src)
     rel = src.relative_to(RUNTIME) if src.is_relative_to(RUNTIME) else Path(src.name)
-    return out / 'obj' / 'runtime' / rel.with_suffix('.o')
+    return out / 'obj' / ('nce-aarch64' if TARGET == 'aarch64' else '') / 'runtime' / rel.with_suffix('.o')
 
 
 def module_glue(layout, linked, hashes, paths, version):
     """C for build/<version>/modules.c: the layout table, the linked modules' function tables (dispatch.h), the
     expected ExeFS hashes, the game version and the default game paths (host.h)."""
     out = [f'// Module glue written by tools/build_game.py; do not edit. {GENERATED_MARKER}',
-           '#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
+           '#include <stddef.h>', '#include "dispatch.h"', '#include "host.h"', '#include "layout.h"', '']
     for name, base, size in layout:
         u = name.upper()
         out.append(f'_Static_assert(MOD_{u}_BASE == {base:#x}ull && MOD_{u}_SIZE == {size:#x}ull, '
@@ -362,14 +393,15 @@ def module_glue(layout, linked, hashes, paths, version):
     out += ['', 'const RtLayoutEntry rt_layout[] = {']
     out += [f'    {{"{n}", MOD_{n.upper()}_BASE, MOD_{n.upper()}_SIZE}},' for n, _, _ in layout]
     out += ['};', f'const int rt_layout_count = {len(layout)};', '']
-    for name in linked:
-        out += [f'extern const uint64_t {name}_fn_addrs[];', f'extern const GuestFn {name}_fn_ptrs[];',
-                f'extern const uint64_t {name}_fn_count;']
+    if TARGET != 'aarch64':
+        for name in linked:
+            out += [f'extern const uint64_t {name}_fn_addrs[];', f'extern const GuestFn {name}_fn_ptrs[];',
+                    f'extern const uint64_t {name}_fn_count;']
     out += ['', 'int rt_linked_modules(RtModule *out, int max) {', '    int n = 0;']
     for name in linked:
         u = name.upper()
-        out.append(f'    if (n < max) out[n++] = (RtModule){{"{name}", MOD_{u}_BASE, MOD_{u}_SIZE, {name}_fn_addrs, '
-                   f'{name}_fn_ptrs, {name}_fn_count}};')
+        funcs = 'NULL, NULL, 0' if TARGET == 'aarch64' else f'{name}_fn_addrs, {name}_fn_ptrs, {name}_fn_count'
+        out.append(f'    if (n < max) out[n++] = (RtModule){{"{name}", MOD_{u}_BASE, MOD_{u}_SIZE, {funcs}}};')
     out += ['    return n;', '}', '']
     out += ['const RtFileHash rt_exefs_sha256[] = {']
     out += [f'    {{{c_string(f)}, {c_string(h)}}},' for f, h in sorted(hashes.items())]
@@ -402,7 +434,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     # the cached objects save the compile step on the next build.
     cache = f'{cmd_arg(os.environ["SCCACHE"])} ' if os.environ.get('SCCACHE') else ''
     lines = [
-        '# Written by tools/build_game.py; do not edit.',
+        f'# Written by tools/build_game.py; do not edit. {GENERATED_MARKER}',
         'ninja_required_version = 1.10',
         f'builddir = {ninja_path(out)}',
         f'cc = {cache}{cmd_arg(CLANG.as_posix())}',
@@ -455,6 +487,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         sources = [p for p in sources if p.name in INSTALL_SIDE] + [out / 'modules.c']
     else:
         sources += [out / 'modules.c']
+        if TARGET == 'aarch64':
+            sources += [gen / 'nce_generated.c']
     for src in sources:
         o = runtime_object(out, src)
         if src.suffix == '.rc':   # windres writes no depfile: the files totk.rc embeds are listed by hand
@@ -789,10 +823,12 @@ def mib(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--version', default='v121', help='game version (default v121)')
-    ap.add_argument('--cpu', choices=('v2', 'v3'), default='v3',
+    ap.add_argument('--target', choices=('x86_64', 'aarch64'),
+                    help='target architecture (default: Linux host architecture, x86_64 on Windows)')
+    ap.add_argument('--cpu', choices=('v2', 'v3'),
                     help='target CPU level: v3 (AVX2/FMA, default) or v2 (SSE4.2, for older CPUs; slower)')
-    ap.add_argument('--gen', type=Path, help='generated C directory (default generated/<version>)')
-    ap.add_argument('--out', type=Path, help='build directory (default build/<version>)')
+    ap.add_argument('--gen', type=Path, help='generated directory (default generated/<version>, or <version>-nce on ARM)')
+    ap.add_argument('--out', type=Path, help='build directory (default build/<version>, or build/nce-linux/<version> on ARM)')
     ap.add_argument('--modules', help='comma-separated subset of the layout modules (default all)')
     ap.add_argument('--jobs', type=int, help='parallel compiles (default: by memory budget and CPU count)')
     ap.add_argument('--compile-only', action='store_true', help='compile, do not link')
@@ -832,10 +868,19 @@ def main():
     ap.add_argument('--expected', type=Path,
                     help='expected hashes (default tools/data/expected-<display version>.json)')
     args = ap.parse_args()
-    set_cpu(args.cpu)
+    set_target(args.target or default_target(), args.cpu)
+    native = TARGET == 'aarch64'
+    if native:
+        for option in ('pgo', 'modules', 'runtime_lib', 'make_runtime_lib'):
+            if getattr(args, option):
+                ap.error(f'--{option.replace("_", "-")} is not supported with --target aarch64')
 
-    gen = (args.gen or ROOT / 'generated' / args.version).resolve()
-    out = (args.out or ROOT / 'build' / args.version).resolve()
+    gen = (args.gen or ROOT / 'generated' / (args.version + ('-nce' if native else ''))).resolve()
+    main_out = (ROOT / 'build' / ('nce-linux' if native else '') / args.version).resolve()
+    out = (args.out or main_out).resolve()
+    if native and (gen == (ROOT / 'generated' / args.version).resolve() or
+                   out == (ROOT / 'build' / args.version).resolve()):
+        ap.error('native metadata and builds must not share the lifted build directories')
     if args.pgo:
         if args.pgo == 'gen' and WIN and not args.toolchain:
             sys.exit('--pgo gen: MSYS2 UCRT64 clang ships no profile runtime (clang_rt.profile); pass --toolchain with '
@@ -879,7 +924,9 @@ def main():
             LINK_LIBS[LINK_LIBS.index(f'-l{lib}')] = f'-l:lib{lib}.a'
     if args.sysroot and not WIN:
         # Every compile and the link: the game then needs no newer glibc than the sysroot's (the Steam Runtime's)
-        sysroot = ['--target=x86_64-linux-gnu', f'--sysroot={cmd_path(args.sysroot.resolve())}']
+        sysroot = [f'--sysroot={cmd_path(args.sysroot.resolve())}']
+        if TARGET == 'x86_64' and '--target=x86_64-linux-gnu' not in RT_FLAGS:
+            sysroot.insert(0, '--target=x86_64-linux-gnu')
         GEN_FLAGS[:0] = sysroot
         RT_FLAGS[:0] = sysroot
         LINK_FLAGS[:0] = sysroot
@@ -888,7 +935,10 @@ def main():
             sys.exit(f'{tool} not found: install ' + ('MSYS2 UCRT64 clang, lld and ninja' if WIN else 'clang, lld and ninja')
                      + ' (docs/building.md)')
     if not (gen / 'layout.json').is_file():
-        sys.exit(f'{gen / "layout.json"} not found: run the generator first')
+        generator = 'tools/prepare_nce.py' if native else 'the generator'
+        sys.exit(f'{gen / "layout.json"} not found: run {generator} first')
+    if native and not (gen / 'nce_generated.c').is_file():
+        sys.exit(f'{gen / "nce_generated.c"} not found: run tools/prepare_nce.py first')
 
     layout = read_layout(gen)
     names = [n for n, _, _ in layout]
@@ -898,7 +948,7 @@ def main():
         sys.exit(f'unknown modules {unknown}; the layout has {names}')
     linked = [m for m in names if m in wanted]
     # --make-runtime-lib builds runtime/ only, so it never reads the generated chunks
-    mods = {} if args.make_runtime_lib else {m: chunk_files(gen, m) for m in linked}
+    mods = {} if args.make_runtime_lib or native else {m: chunk_files(gen, m) for m in linked}
 
     cpus = os.cpu_count() or 1
     budget = min(MEM_BUDGET, int(total_ram() * 0.8))
@@ -920,10 +970,11 @@ def main():
     if stale:
         sys.exit(f'{stale[0]}: its SPIR-V header no longer matches; run python tools/build_shaders.py')
     skip = {s for s in args.skip_runtime.split(',') if s}
-    main_out = (ROOT / 'build' / args.version).resolve()
     pairs = None
     if args.make_runtime_lib:
         mods, linked, why = {}, [], ''
+    elif native:
+        why = ''
     elif args.full_build:
         why = '--full-build'
     elif args.toolchain:
@@ -958,7 +1009,8 @@ def main():
         env['PATH'] = str(TOOLCHAIN_BIN or UCRT) + os.pathsep + os.environ.get('PATH', '')
     base = [str(NINJA), '-f', str(out / 'build.ninja'), '-j', str(jobs)]
     nfiles = sum(len(v) for v in mods.values())
-    print(f'build_game: {nfiles} generated files in {len(linked)} modules ({", ".join(linked)}), {jobs} jobs', flush=True)
+    mode = 'native guest execution' if native else f'{nfiles} generated files'
+    print(f'build_game: {mode} in {len(linked)} modules ({", ".join(linked)}), {jobs} jobs', flush=True)
 
     code, dt, peak_one, peak_all = run_measured(base + ['objects'], env)
     print(f'compile: {dt:.1f} s, peak {mib(peak_one)} per process' + (f', {mib(peak_all)} all processes' if WIN else ''))
@@ -968,7 +1020,7 @@ def main():
         size = sum(o.stat().st_size for o in files)
         print(f'  {mod:8} {len(files):5} objects {mib(size):>14}')
     verify_objects(out, objs, pairs is not None, main_out, pairs, base, env)
-    if args.cpu == 'v2':
+    if TARGET == 'x86_64' and args.cpu == 'v2':
         # Inline assembly, target attributes and intrinsics pass -march=x86-64-v2 by; one vmovdqa of a YMM register
         # stops a CPU without AVX (tools/check_isa.py)
         fail = check_isa.check_objects(objs['runtime'], objdump_tool(), out / 'obj' / 'runtime' / 'isa-v2.json')
@@ -992,7 +1044,7 @@ def main():
     sections, image = pe_sections(exe) if WIN else elf_sections(exe)
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
-    if image > 3 * GiB // 2:
+    if TARGET == 'x86_64' and image > 3 * GiB // 2:
         print('build_game: warning: image over 1.5 GiB; RIP-relative code reaches only 2 GiB', file=sys.stderr)
 
 

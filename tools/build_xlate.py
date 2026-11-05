@@ -2,7 +2,7 @@
 
 Copies tools/vendor/ryujinx to build/xlate/ryujinx, applies tools/xlate/patches/*.patch there (tools/vendor stays
 byte-identical; 0001-0004 are MNG's, 0005-0013, 0015 and 0016 are ours), then runs `dotnet publish`. Needs the .NET 10 SDK, the MSVC build
-tools and vswhere.exe (docs/building.md). Run with .venv. On Linux it builds build/xlate/totk_xlate for linux-x64, which
+tools and vswhere.exe (docs/building.md). Run with .venv. On Linux it builds totk_xlate for linux-x64 or linux-arm64, which
 NativeAOT links with the system's clang (no MSVC); NativeAOT builds for the OS it runs on only.
 
 Next to the exe it writes totk_xlate.id: the translator identity, a sha256 over everything the build reads (this script,
@@ -18,6 +18,7 @@ translator change re-keys the cache without a hand-made KEY_VERSION bump. --id-o
 import argparse
 import hashlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,46 @@ BUILD = ROOT / "build" / "xlate"
 WIN = os.name == "nt"
 EXE = "totk_xlate.exe" if WIN else "totk_xlate"
 VSWHERE_DIR = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer"
+
+
+def default_target() -> str:
+    if WIN:
+        return "x86_64"
+    machine = platform.machine().lower()
+    if machine in ("aarch64", "arm64"):
+        return "aarch64"
+    if machine in ("x86_64", "amd64"):
+        return "x86_64"
+    sys.exit(f"unsupported host architecture: {machine}")
+
+
+def build_dir(target: str) -> Path:
+    return ROOT / "build" / ("xlate-aarch64" if target == "aarch64" else "xlate")
+
+
+def runtime_id(target: str) -> str:
+    if WIN:
+        if target != "x86_64":
+            sys.exit("Windows supports only --target x86_64")
+        return "win-x64"
+    return "linux-arm64" if target == "aarch64" else "linux-x64"
+
+
+def check_architecture(exe: Path, target: str) -> None:
+    if not exe.is_file():
+        sys.exit(f"{exe}: translator missing; rebuild it")
+    with exe.open("rb") as f:
+        head = f.read(64)
+        if WIN and head[:2] == b"MZ":
+            f.seek(int.from_bytes(head[60:64], "little"))
+            pe = f.read(6)
+            valid = pe[:4] == b"PE\0\0" and pe[4:6] == b"\x64\x86"
+        else:
+            machine = 183 if target == "aarch64" else 62
+            valid = (not WIN and head[:6] == b"\x7fELF\x02\x01" and
+                     int.from_bytes(head[18:20], "little") == machine)
+    if not valid:
+        sys.exit(f"{exe}: not a {runtime_id(target)} translator; rebuild it")
 
 
 def tree_hashes(base: Path) -> dict[str, str]:
@@ -135,15 +176,19 @@ def write_identity(exe: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--id-only", action="store_true", help="write totk_xlate.id for the exe already built")
-    parser.add_argument("--out", type=Path, help="build directory instead of build/xlate")
+    parser.add_argument("--out", type=Path, help="build directory instead of build/xlate (build/xlate-aarch64 on ARM)")
+    parser.add_argument("--target", choices=("x86_64", "aarch64"),
+                        help="target architecture (default: Linux host architecture, x86_64 on Windows)")
     parser.add_argument("--llvm", type=Path, help="Linux: an LLVM directory whose bin/clang and lld link the exe")
     parser.add_argument("--sysroot", type=Path, help="Linux: link against this sysroot's glibc instead of the host's "
                                                      "(tools/make_release_linux.py)")
     a = parser.parse_args()
-    if a.out:
-        global BUILD
-        BUILD = a.out.resolve()
+    target = a.target or default_target()
+    rid = runtime_id(target)
+    global BUILD
+    BUILD = a.out.resolve() if a.out else build_dir(target)
     if a.id_only:
+        check_architecture(BUILD / EXE, target)
         write_identity(BUILD / EXE)
         return
     started = time.time()
@@ -166,7 +211,7 @@ def main() -> None:
     out = BUILD / "publish"
     shutil.rmtree(out, ignore_errors=True)
     cmd = [
-        dotnet, "publish", str(work / "totk_xlate.csproj"), "-c", "Release", "-r", "win-x64" if WIN else "linux-x64",
+        dotnet, "publish", str(work / "totk_xlate.csproj"), "-c", "Release", "-r", rid,
         "-p:PublishAot=true", "-p:InvariantGlobalization=true", f"-p:RyuSrc={src}", "-o", str(out),
     ]
     if a.llvm:
@@ -177,6 +222,7 @@ def main() -> None:
     if subprocess.run(cmd, env=env).returncode != 0:
         sys.exit("dotnet publish failed")
     exe = BUILD / EXE
+    check_architecture(out / EXE, target)
     shutil.copy2(out / EXE, exe)
     write_identity(exe)
     print(f"built {exe} ({exe.stat().st_size / 1e6:.1f} MB) in {time.time() - started:.0f} s")

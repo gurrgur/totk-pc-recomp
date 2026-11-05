@@ -14,6 +14,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "nce.h"
 #include "layout.h"
 #include "platform/platform.h"
 
@@ -221,6 +222,9 @@ void mem_init(void) {
     if (!reserve_at(mods_lo, mods_hi - mods_lo, 0)) reexec_or_fail("the module window");
     if (!reserve_at(RT_KERNEL_BASE, RT_KERNEL_SIZE, 0)) reexec_or_fail("the kernel region");
     if (!reserve_at(RT_HOSTFN_BASE, RT_HOSTFN_SIZE, 0)) reexec_or_fail("the host-function window");
+#if RT_NCE
+    rt_nce_reserve(mods_hi);
+#endif
 
     // Stack and heap block, then the alias region above it, both searched below the module window.
     uint64_t low = 0, alias = 0;

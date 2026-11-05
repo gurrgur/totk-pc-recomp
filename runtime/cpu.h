@@ -5,6 +5,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifndef RT_NCE
+#define RT_NCE 0
+#endif
+
 typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t x[32];          // x0-x30 (x[31] unused; sp is separate)
     uint64_t sp;             // 256
@@ -15,10 +19,15 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t excl_addr;      // 296
     uint64_t excl_val;       // 304
     void *thread;            // 312: runtime thread object
-    uint64_t fpcr;           // 320: guest FPCR/FPSR (portable FP/SIMD lowering only; the asm path uses the host's)
+    uint64_t fpcr;           // 320: canonical guest FPCR for portable helpers and native boundaries
     uint64_t fpsr;           // 328
     uint64_t excl_val_hi;    // 336: upper half of a 128-bit exclusive pair (LDXP/LDAXP of two X registers)
+#if RT_NCE
+    struct NceFrame *nce_frame; // Private activations follow their fiber, not its current host thread.
+    uint8_t _pad[512 - 352];
+#else
     uint8_t _pad[512 - 344];
+#endif
     __uint128_t v[32];       // 512
 } Cpu;
 
@@ -44,7 +53,15 @@ static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0,
 static inline uint64_t rt_get_fpsr(void) { uint64_t v; __asm__ volatile("mrs %0, fpsr" : "=r"(v)); return v; }
 static inline void rt_set_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" :: "r"(v)); }
 static inline void rt_set_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" :: "r"(v)); }
-static inline void rt_fpcr_sync(const Cpu *c) { (void)c; }
+static inline void rt_fpcr_sync(const Cpu *c) {
+#if RT_NCE
+    // Portable helpers use nearest/FZ; the bridge restores full guest modes separately.
+    rt_set_fpcr(c->fpcr & (1u << 24));
+    rt_set_fpsr(0);
+#else
+    (void)c;
+#endif
+}
 #else
 // Host FP state is not the guest's here: code lifted with --simd=c keeps FPCR/FPSR in Cpu (c->fpcr, zeroed
 // with the Cpu), so the host-side reset in thread start-up has nothing to do.

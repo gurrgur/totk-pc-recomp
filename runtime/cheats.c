@@ -509,6 +509,11 @@ static void rebuild_if_needed(const char *dir) {
 }
 
 void cheats_init(void) {
+#if RT_NCE
+    mods_scan();
+    rt_log("cheats: executable modifications are unavailable with native execution");
+    return;
+#endif
     const RtLoaded *m = ldr_count() ? ldr_module(0) : NULL;
     char dir[PLAT_PATH_MAX], bid[17], path[2400];   // path: a mod's cheats folder (ModInfo.cheats) + the file
     if (!m || !exe_dir(dir, sizeof dir) || !build_id(bid)) return;

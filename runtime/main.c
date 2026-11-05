@@ -29,8 +29,12 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "nce.h"
 #include "platform/platform.h"
 #include "sha256.h"
+#if RT_NCE
+#include <signal.h>
+#endif
 
 #define MAX_MODULES 16
 
@@ -230,6 +234,10 @@ static void crash_handler(const PlatCrash *x) {
     rt_log_raw("\n", 1);
     if (x->cxx_type)
         rt_logf("  C++ type %s%s%s\n", x->cxx_type, x->cxx_what ? ", what(): " : "", x->cxx_what ? x->cxx_what : "");
+#if RT_NCE
+    if (x->code == SIGILL && rt_nce_constrained_pc(rip))
+        rt_logf("  unsupported host: original constrained exclusive encoding faulted\n");
+#endif
     uint64_t f = x->module ? 0 : lifted_function(rip);
     if (f) rt_logf("  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
     // abort and invalid parameter: where the host code called it; a fault in another module: the driver code and the
@@ -286,6 +294,9 @@ static void host_probe(Cpu *c) { host_probe_hits++; c->x[0] = 42; }
 #endif
 
 static void check_cpu(void) {
+#if RT_NCE
+    printf("cpu: native Linux AArch64\n");
+#else
     __builtin_cpu_init();
 #if RT_CPU_LEVEL >= 3
     int ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2");
@@ -295,6 +306,7 @@ static void check_cpu(void) {
     int ok = __builtin_cpu_supports("sse4.2") && __builtin_cpu_supports("popcnt");
     printf("cpu: x86-64-v2 (SSE4.2, POPCNT) %s\n", ok ? "present" : "MISSING");
     CHECK(ok, "the lifted code is built for x86-64-v2");
+#endif
 #endif
 }
 
@@ -435,7 +447,11 @@ static int selftest(void) {
            n, (unsigned long long)s.lo, (unsigned long long)s.hi, (unsigned long long)s.slots,
            (double)s.table_bytes / (1 << 20), dt * 1e3);
     check_modules(mods, n);
+#if RT_NCE
+    CHECK(!rt_nce_original_pc(rt_layout[0].base), "unloaded native text became callable during host-only seal");
+#else
     CHECK(s.functions > 0, "no functions linked");
+#endif
     Cpu *c = plat_aligned_alloc(sizeof(Cpu), 64);
     memset(c, 0, sizeof *c);
     uint64_t r = rt_call(c, probe, 1, (uint64_t)7);

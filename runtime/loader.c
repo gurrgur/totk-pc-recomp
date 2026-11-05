@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "host.h"
+#include "nce.h"
 #include "layout.h"
 #include "platform/platform.h"
 
@@ -437,8 +438,18 @@ static void verify_identity(void) {
 
 // .text and .rodata read-only: guest code never executes from guest memory, and nothing may write them.
 static void seal(Mod *m) {
+#if RT_NCE
+    if ((m->seg_off[0] | m->seg_off[1] | m->pub.data_off) & 0xfff)
+        rt_fatal("loader: native segment boundaries must be page aligned");
+    uint64_t text_end = (m->pub.text_end + 0xfff) & ~0xfffull;
+    if (text_end > m->seg_off[1] ||
+        !plat_mem_protect(m->pub.base, text_end, PLAT_PROT_RX) ||
+        !plat_mem_protect(m->pub.base + text_end, m->pub.data_off - text_end, PLAT_PROT_READ))
+        rt_fatal("loader: cannot seal native text/rodata for %s", m->pub.name);
+#else
     if (!plat_mem_protect(m->pub.base, m->pub.data_off, PLAT_PROT_READ))
         rt_fatal("loader: cannot seal %s", m->pub.name);
+#endif
 }
 
 void ldr_load(const char *exefs_dir) {
@@ -457,6 +468,9 @@ void ldr_load(const char *exefs_dir) {
         mods[i].pub.ctor_flag = decode_ctor_flag(&mods[i]);
     }
     verify_identity();
+#if RT_NCE
+    for (int i = 0; i < nmods; i++) rt_nce_load(mods[i].pub.name, mods[i].pub.base, mods[i].pub.size);
+#endif
     for (int i = 0; i < nmods; i++) seal(&mods[i]);
     for (int i = 0; i < nmods; i++) {
         const Mod *m = &mods[i];
@@ -588,7 +602,7 @@ static void probe_override(Cpu *c) {
     c->x[0] = PROBE_MAGIC;
 }
 
-// .text and .rodata in guest memory equal the NSO: relocations never touched them.
+// Relocations preserve text/rodata; native text additionally has the verified instruction rewrites.
 static void check_segments(const char *dir) {
     for (int i = 0; i < nmods; i++) {
         const Mod *m = &mods[i];
@@ -601,17 +615,33 @@ static void check_segments(const char *dir) {
             uint8_t *buf = malloc(seg[s].size ? seg[s].size : 1);
             if (!buf) rt_fatal("probe: allocation");
             nso_segment(raw, &seg[s], buf, m->pub.name, s);
+#if RT_NCE
+            if (s == 0) {
+                if (!rt_nce_check_text(m->pub.name, m->pub.base + seg[s].mem_off, buf, seg[s].size)) same = 0;
+            } else
+#endif
             if (memcmp(buf, (const void *)(uintptr_t)(m->pub.base + seg[s].mem_off), seg[s].size)) same = 0;
             free(buf);
         }
         free(raw);
         uint64_t ro_end;
+#if RT_NCE
+        uint64_t text_end = m->pub.base + ((m->pub.text_end + 0xfff) & ~0xfffull), code_end;
+        uint64_t data = m->pub.base + m->pub.data_off;
+        int ro = plat_mem_state(m->pub.base, text_end, &code_end) == PLAT_PROT_RX && code_end == text_end &&
+                 (text_end == data || (plat_mem_state(text_end, data, &ro_end) == PLAT_PROT_READ && ro_end == data));
+        printf("  %-8s native text/rodata: bytes %s, %s\n", m->pub.name,
+               same ? "match rewrites and original data" : "DIFFER FROM expected image", ro ? "RX/R" : "BAD PROTECTION");
+        CHECK(same, "%s native text/rodata differ from the expected installed image", m->pub.name);
+        CHECK(ro, "%s native text/rodata are not sealed RX/R", m->pub.name);
+#else
         int ro = plat_mem_state(m->pub.base, m->pub.base + m->pub.data_off, &ro_end) == PLAT_PROT_READ &&
                  ro_end == m->pub.base + m->pub.data_off;
         printf("  %-8s text %#x+%#x rodata %#x+%#x: bytes %s the NSO, %s\n", m->pub.name, seg[0].mem_off, seg[0].size,
                seg[1].mem_off, seg[1].size, same ? "equal" : "DIFFER FROM", ro ? "read-only" : "NOT READ-ONLY");
         CHECK(same, "%s .text/.rodata changed after relocation", m->pub.name);
         CHECK(ro, "%s .text/.rodata are not sealed read-only", m->pub.name);
+#endif
     }
 }
 
