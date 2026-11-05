@@ -36,6 +36,58 @@
 
 #include "platform.h"
 
+#if defined(__aarch64__)
+#include <asm/sigcontext.h>
+#endif
+
+static uint64_t context_pc(const ucontext_t *u) {
+#if defined(__aarch64__)
+    return u->uc_mcontext.pc;
+#else
+    return (uint64_t)u->uc_mcontext.gregs[REG_RIP];
+#endif
+}
+
+static uint64_t context_sp(const ucontext_t *u) {
+#if defined(__aarch64__)
+    return u->uc_mcontext.sp;
+#else
+    return (uint64_t)u->uc_mcontext.gregs[REG_RSP];
+#endif
+}
+
+static void context_set_pc(ucontext_t *u, uint64_t pc) {
+#if defined(__aarch64__)
+    u->uc_mcontext.pc = pc;
+#else
+    u->uc_mcontext.gregs[REG_RIP] = (greg_t)pc;
+#endif
+}
+
+static int context_access(const ucontext_t *u) {
+#if defined(__aarch64__)
+    const uint8_t *p = u->uc_mcontext.__reserved;
+    size_t left = sizeof u->uc_mcontext.__reserved;
+    while (left >= sizeof(struct _aarch64_ctx)) {
+        const struct _aarch64_ctx *h = (const void *)p;
+        if (!h->magic || h->size < sizeof *h || h->size > left || (h->size & 15)) break;
+        if (h->magic == ESR_MAGIC && h->size >= sizeof(struct esr_context)) {
+            uint64_t esr = ((const struct esr_context *)h)->esr;
+            unsigned ec = (unsigned)(esr >> 26) & 63;
+            if (ec == 0x20 || ec == 0x21) return 8;
+            if (ec == 0x24 || ec == 0x25) return (esr >> 6) & 1;
+            return -1;
+        }
+        p += h->size;
+        left -= h->size;
+    }
+    return -1;
+#else
+    long err = u->uc_mcontext.gregs[REG_ERR];
+    return (err & 16) ? 8 : (err & 2) ? 1 : 0;
+#endif
+}
+
 // The write-watch ABI of Linux 6.7 (uapi linux/fs.h and linux/userfaultfd.h), for headers older than it: the release
 // builds against the Steam Runtime's 5.10 headers and runs on newer kernels. The kernel refuses what it lacks at run time.
 #ifndef PAGEMAP_SCAN
@@ -194,6 +246,8 @@ struct PlatIntr {
     pthread_t pt;
     volatile int32_t state;
     uint64_t rip, rsp, to;
+    void (*callback)(void *context, void *arg);
+    void *arg;
 };
 
 static __thread PlatIntr *intr_me;
@@ -204,13 +258,16 @@ static void intr_handler(int sig, siginfo_t *si, void *uc) {
     PlatIntr *t = intr_me;
     ucontext_t *u = uc;
     if (!t) return;
-    t->rip = (uint64_t)u->uc_mcontext.gregs[REG_RIP];
-    t->rsp = (uint64_t)u->uc_mcontext.gregs[REG_RSP];
+    t->rip = context_pc(u);
+    t->rsp = context_sp(u);
     int32_t req = INTR_REQ;
     if (!__atomic_compare_exchange_n(&t->state, &req, INTR_STOPPED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
     while (__atomic_load_n(&t->state, __ATOMIC_ACQUIRE) != INTR_GO) plat_pause();
-    if (t->to) u->uc_mcontext.gregs[REG_RIP] = (greg_t)t->to;
+    void (*callback)(void *context, void *arg) = t->callback;
+    void *arg = t->arg;
+    if (t->to) context_set_pc(u, t->to);
     __atomic_store_n(&t->state, INTR_IDLE, __ATOMIC_RELEASE);
+    if (callback) callback(u, arg);
 }
 
 PlatIntr *plat_intr_self(void) {
@@ -262,16 +319,23 @@ int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp) {
 }
 
 int plat_intr_resume(PlatIntr *t, uint64_t to) {
+    t->callback = NULL;
     t->to = to;
     __atomic_store_n(&t->state, INTR_GO, __ATOMIC_RELEASE);
     return 1;
 }
 
+int plat_intr_resume_callback(PlatIntr *t, void (*fn)(void *context, void *arg), void *arg) {
+    t->callback = fn;
+    t->arg = arg;
+    t->to = 0;
+    __atomic_store_n(&t->state, INTR_GO, __ATOMIC_RELEASE);
+    return 1;
+}
+
 // ---- fibers: a stack switch of our own. glibc's swapcontext saves and restores the signal mask with a system call
-// on every switch, and the game switches fibers often. fiber_swap saves the callee-saved registers, the MXCSR and the
-// x87 control word on the current stack, stores the stack pointer in *save and loads the other one. A new fiber's
-// stack is laid out as fiber_swap leaves one, returning into fiber_entry, which realigns the stack and calls fn(arg)
-// (r12 and r13).
+// on every switch, and the game switches fibers often. fiber_swap saves the ABI's callee-saved registers and FP state
+// on the current stack, stores the stack pointer in *save and loads the other one. A new stack returns into fiber_entry.
 struct PlatFiber {
     void *sp;
     void *stack;   // mapped stack (NULL for a thread's own context)
@@ -280,6 +344,55 @@ struct PlatFiber {
 
 void plat_fiber_swap(void **save, void *load);
 void plat_fiber_entry(void);
+#if defined(__aarch64__)
+// AAPCS64 preserves x19-x29 and the low 64 bits of v8-v15; x30 holds the return address.
+__asm__(".text\n"
+        ".globl plat_fiber_swap\n"
+        ".type plat_fiber_swap, %function\n"
+        ".p2align 4\n"
+        "plat_fiber_swap:\n"
+        "    sub sp, sp, #176\n"
+        "    stp x19, x20, [sp, #0]\n"
+        "    stp x21, x22, [sp, #16]\n"
+        "    stp x23, x24, [sp, #32]\n"
+        "    stp x25, x26, [sp, #48]\n"
+        "    stp x27, x28, [sp, #64]\n"
+        "    stp x29, x30, [sp, #80]\n"
+        "    stp d8, d9, [sp, #96]\n"
+        "    stp d10, d11, [sp, #112]\n"
+        "    stp d12, d13, [sp, #128]\n"
+        "    stp d14, d15, [sp, #144]\n"
+        "    mrs x2, fpcr\n"
+        "    mrs x3, fpsr\n"
+        "    stp x2, x3, [sp, #160]\n"
+        "    mov x2, sp\n"
+        "    str x2, [x0]\n"
+        "    mov sp, x1\n"
+        "    ldp x2, x3, [sp, #160]\n"
+        "    msr fpcr, x2\n"
+        "    msr fpsr, x3\n"
+        "    ldp d8, d9, [sp, #96]\n"
+        "    ldp d10, d11, [sp, #112]\n"
+        "    ldp d12, d13, [sp, #128]\n"
+        "    ldp d14, d15, [sp, #144]\n"
+        "    ldp x19, x20, [sp, #0]\n"
+        "    ldp x21, x22, [sp, #16]\n"
+        "    ldp x23, x24, [sp, #32]\n"
+        "    ldp x25, x26, [sp, #48]\n"
+        "    ldp x27, x28, [sp, #64]\n"
+        "    ldp x29, x30, [sp, #80]\n"
+        "    add sp, sp, #176\n"
+        "    ret\n"
+        ".size plat_fiber_swap, .-plat_fiber_swap\n"
+        ".globl plat_fiber_entry\n"
+        ".type plat_fiber_entry, %function\n"
+        ".p2align 4\n"
+        "plat_fiber_entry:\n"
+        "    mov x0, x20\n"
+        "    blr x19\n"
+        "    brk #0\n"
+        ".size plat_fiber_entry, .-plat_fiber_entry\n");
+#else
 __asm__(".text\n"
         ".globl plat_fiber_swap\n"
         ".type plat_fiber_swap, @function\n"
@@ -322,6 +435,7 @@ __asm__(".text\n"
         "    callq *%r12\n"
         "    ud2\n"
         ".size plat_fiber_entry, .-plat_fiber_entry\n");
+#endif
 
 static __thread PlatFiber *fiber_cur;
 static __thread PlatFiber fiber_own;
@@ -346,6 +460,13 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     mprotect(m, 4096, PROT_NONE);
     f->stack = m, f->size = stack;
     uint64_t *top = (uint64_t *)(((uintptr_t)m + stack) & ~(uintptr_t)15);
+#if defined(__aarch64__)
+    uint64_t *sp = top - 22;
+    memset(sp, 0, 176);
+    sp[0] = (uint64_t)(uintptr_t)fn;    // x19
+    sp[1] = (uint64_t)(uintptr_t)arg;   // x20
+    sp[11] = (uint64_t)(uintptr_t)plat_fiber_entry;   // x30
+#else
     uint64_t *sp = top - 10;   // fpu state (2 words), r15, r14, r13, r12, rbx, rbp, return address, padding
     sp[0] = 0x037f;            // x87 control word: the default
     sp[1] = 0x1f80;            // MXCSR: the default
@@ -355,6 +476,7 @@ PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
     sp[6] = sp[7] = 0;         // rbx, rbp
     sp[8] = (uint64_t)(uintptr_t)plat_fiber_entry;
     sp[9] = 0;
+#endif
     f->sp = sp;
     return f;
 }
@@ -806,7 +928,7 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
 
 #define PG 4096ull
 #define PS_LIMIT (1ull << 39)
-enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
+enum { PS_FREE, PS_RESERVED, PS_NONE, PS_READ, PS_RW, PS_RX };   // PS_NONE.. are committed: PLAT_PROT_* + PS_NONE
 static uint8_t *pstate;
 static int ww_fd = -1, pm_fd = -1;   // userfaultfd and /proc/self/pagemap; -1 when write watch is unavailable
 static PlatMutex vm_lock = PLAT_MUTEX_INIT;
@@ -878,7 +1000,9 @@ int plat_mem_decommit(uint64_t addr, uint64_t n) {
 }
 
 int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
-    int p = prot == PLAT_PROT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
+    if (prot < PLAT_PROT_NONE || prot > PLAT_PROT_RX) return 0;
+    int p = prot == PLAT_PROT_RW ? PROT_READ | PROT_WRITE : prot == PLAT_PROT_RX ? PROT_READ | PROT_EXEC
+            : prot == PLAT_PROT_READ ? PROT_READ : PROT_NONE;
     if (mprotect((void *)(uintptr_t)addr, n, p)) return 0;
     ps_set(addr, n, (uint8_t)(PS_NONE + prot));
     return 1;
@@ -932,9 +1056,9 @@ static void (*crash_fn)(const PlatCrash *c);
 
 static void fault_handler(int sig, siginfo_t *si, void *uc) {
     ucontext_t *u = uc;
-    long err = u->uc_mcontext.gregs[REG_ERR];
-    if (sig == SIGSEGV && fault_hook && (err & 2) && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
-    uintptr_t rip = (uintptr_t)u->uc_mcontext.gregs[REG_RIP];
+    int access = context_access(u);
+    if (sig == SIGSEGV && fault_hook && access == 1 && fault_hook((uint64_t)(uintptr_t)si->si_addr)) return;
+    uintptr_t rip = (uintptr_t)context_pc(u);
     Dl_info at, self;
     if (crash_fn) {
         int found = dladdr((void *)rip, &at) && at.dli_fname;
@@ -948,7 +1072,7 @@ static void fault_handler(int sig, siginfo_t *si, void *uc) {
             c.module = n ? n + 1 : at.dli_fname;
         }
         if (sig == SIGSEGV || sig == SIGBUS)
-            c.access = (err & 16) ? 8 : (err & 2) ? 1 : 0, c.addr = (uint64_t)(uintptr_t)si->si_addr;
+            c.access = access, c.addr = (uint64_t)(uintptr_t)si->si_addr;
         crash_fn(&c);
     }
     signal(sig, SIG_DFL);   // returns into the faulting instruction, which faults again with the default action

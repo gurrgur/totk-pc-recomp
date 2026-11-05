@@ -10,6 +10,8 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include "fp_x86.h"
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include "fp_aarch64.h"
 #endif
 
 // ---- threads
@@ -51,6 +53,13 @@ int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp);
 // Lets a stopped t go on: at to when to is nonzero, else where it stopped. 0 when the redirection failed (t then goes
 // on where it stopped).
 int plat_intr_resume(PlatIntr *t, uint64_t to);
+#ifdef __linux__
+// Dispatches fn on the stopped thread inside its signal handler; does not wait for callback completion.
+// context is its original Linux ucontext. fn must return normally on the same thread without changing context,
+// signal mask or altstack, so the original sigreturn restores the interrupted state.
+// fn/arg must stay valid until fn returns. The caller must release any locks fn needs after dispatch.
+int plat_intr_resume_callback(PlatIntr *t, void (*fn)(void *context, void *arg), void *arg);
+#endif
 
 // Fibers: execution contexts with stacks of their own that threads switch between; a fiber may resume on another
 // thread. Each switch keeps the callee-saved registers and the floating-point control state.
@@ -91,7 +100,13 @@ void plat_yield(void);                    // gives the rest of the time slice to
 static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
+#elif defined(__aarch64__)
+    __asm__ volatile("yield");
 #endif
+}
+
+static inline void plat_icache_flush(void *addr, size_t n) {
+    __builtin___clear_cache((char *)addr, (char *)addr + n);
 }
 
 // ---- time
@@ -194,7 +209,7 @@ static inline void *plat_casp(void *volatile *p, void *xchg, void *cmp) {
 
 // ---- virtual memory: ranges reserved at fixed addresses below 2^39, their pages committed, decommitted and protected
 // at 4 KiB granularity.
-enum { PLAT_PROT_NONE, PLAT_PROT_READ, PLAT_PROT_RW };
+enum { PLAT_PROT_NONE, PLAT_PROT_READ, PLAT_PROT_RW, PLAT_PROT_RX };
 enum { PLAT_MEM_FREE = -2, PLAT_MEM_RESERVED = -1 };   // plat_mem_state besides PLAT_PROT_* for committed pages
 // Reserves [addr, addr + n) inaccessible, exactly there: 0 when any of it is taken. watch: writes to its pages are
 // tracked for plat_mem_written.

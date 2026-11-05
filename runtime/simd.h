@@ -5,15 +5,15 @@
 // first quiet NaN), FPCR.DN default NaN, FPCR.FZ flushing (inputs and pre-rounding-tiny results), FPCR.RMode
 // for arithmetic / conversions / FRINTX/I, saturating FP->int conversions, fused multiply-add, ARM estimate
 // tables. Not modelled: FPSR cumulative exception bits and QC, FPCR trap enables, FP16 arithmetic (ARMv8.2).
-// FPCR.AHP is honoured by the half-precision conversions. Host assumptions: IEEE binary32/64, MXCSR in
-// round-to-nearest outside the slow paths, with FTZ|DAZ equal to FPCR.FZ (cpu.h rt_fpcr_sync keeps it so); fma must be
+// FPCR.AHP is honoured by the half-precision conversions. Host assumptions: IEEE binary32/64, host FP in
+// round-to-nearest outside the slow paths, with input/output flush equal to FPCR.FZ (cpu.h rt_fpcr_sync); fma must be
 // correctly rounded: -march=x86-64-v3 has the FMA instruction, and the v2 build links runtime/fma.c for it.
 #pragma once
 #include <fenv.h>
-#include <immintrin.h>
 #include <math.h>
 
 #include "cpu.h"
+#include "platform/platform.h"
 
 typedef __uint128_t u128;
 #define SI static inline __attribute__((always_inline))
@@ -211,26 +211,30 @@ SI int simd_fe_mode(uint64_t fpcr) {
     return m[(fpcr >> 22) & 3];
 }
 
-// MXCSR rounding control (bits 13-14) without fesetround's x87 + SSE double write; ldmxcsr only on change.
-#define SIMD_RC_MASK 0x6000u
+// Change only host rounding control; preserve flush modes and exception state.
+#define SIMD_RC_MASK PLAT_FP_RC_MASK
 SI unsigned simd_rm_set_rc(unsigned cur, unsigned rc) {
-    if ((cur & SIMD_RC_MASK) != rc) _mm_setcsr((cur & ~SIMD_RC_MASK) | rc);
+    if ((cur & SIMD_RC_MASK) != rc) plat_fp_set((cur & ~SIMD_RC_MASK) | rc);
     return cur;
 }
-// Set MXCSR RC from FPCR.RMode (RN 00, RP 10, RM 01, RZ 11); returns the previous MXCSR.
+// Set host rounding from FPCR.RMode; return the previous control register.
 SI unsigned simd_rm_enter(uint64_t fpcr) {
+#if defined(__aarch64__)
+    return simd_rm_set_rc(plat_fp_get(), (unsigned)fpcr & SIMD_RC_MASK);
+#else
     static const unsigned rc[4] = {0x0000u, 0x4000u, 0x2000u, 0x6000u};
-    return simd_rm_set_rc(_mm_getcsr(), rc[(fpcr >> 22) & 3]);
+    return simd_rm_set_rc(plat_fp_get(), rc[(fpcr >> 22) & 3]);
+#endif
 }
 // Force toward-zero.
-SI void simd_rm_rz(void) { simd_rm_set_rc(_mm_getcsr(), 0x6000u); }
-// Restore the MXCSR saved by simd_rm_enter, only if it changed.
+SI void simd_rm_rz(void) { simd_rm_set_rc(plat_fp_get(), SIMD_RC_MASK); }
+// Restore rounding control only if it changed.
 SI void simd_rm_leave(unsigned old) {
-    unsigned cur = _mm_getcsr();
-    if ((cur & SIMD_RC_MASK) != (old & SIMD_RC_MASK)) _mm_setcsr((cur & ~SIMD_RC_MASK) | (old & SIMD_RC_MASK));
+    unsigned cur = plat_fp_get();
+    simd_rm_set_rc(cur, old & SIMD_RC_MASK);
 }
 
-// The thread's MXCSR mirrors the guest FPCR.FZ with RC = nearest whenever guest code runs (cpu.h rt_fpcr_sync), so
+// The thread's host FP control mirrors guest FPCR.FZ with RC = nearest (cpu.h rt_fpcr_sync), so
 // plain host FP gives the ARM result unless FPCR.RMode asks for directed rounding, which the slow paths handle.
 SI int simd_directed(const Cpu *c) { return __builtin_expect((c->fpcr & FPCR_RM) != 0, 0); }
 

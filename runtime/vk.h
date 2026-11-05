@@ -10,7 +10,8 @@
 #include "gfx.h"       // GfxShader, GfxShaderRes, GfxShaderAnswers (pipelines block)
 
 // Required (device choice fails without them): Vulkan 1.3; VK_KHR_swapchain, VK_KHR_push_descriptor,
-// VK_EXT_depth_clip_control, VK_EXT_external_memory_host; features timelineSemaphore, dynamicRendering,
+// VK_EXT_depth_clip_control, VK_EXT_external_memory_host (optional on Linux AArch64 with shadow storage);
+// features timelineSemaphore, dynamicRendering,
 // synchronization2, shaderStorageImageWriteWithoutFormat, depthClipControl, shaderInt64, samplerAnisotropy,
 // independentBlend, geometryShader, textureCompressionBC.
 // Optional (flag set in VkCtx when enabled): the has_* members.
@@ -43,6 +44,7 @@ typedef struct VkCtx {
     // (attachable images get feedback usage, a by-region barrier inside the pass); else (or TOTK_FEEDBACK=restart)
     // VK_FEEDBACK_RESTART (the pass ends and restarts behind the full barrier).
     int feedback;                           // VK_FEEDBACK_*
+    int has_external_memory_host;           // VK_EXT_external_memory_host enabled
     uint32_t min_imported_host_alignment;   // VK_EXT_external_memory_host
     int device_index;                       // index in vkEnumeratePhysicalDevices
 } VkCtx;

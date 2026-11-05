@@ -95,7 +95,7 @@ SI vf32 fma_rn_v(vf32 x, vf32 y, vf32 z) {
 }
 // Any rounding mode: directed modes are exact with a plain double (same-direction double rounding is harmless).
 SI float fma_any_s(float x, float y, float z) {
-    if (__builtin_expect(_mm_getcsr() & 0x6000u, 0)) return (float)((double)x * (double)y + (double)z);
+    if (__builtin_expect(plat_fp_get() & SIMD_RC_MASK, 0)) return (float)((double)x * (double)y + (double)z);
     return fma_rn_s(x, y, z);
 }
 #define FMA_S(x, y, z) fma_rn_s(x, y, z)
@@ -231,7 +231,11 @@ SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
 
 SI VT FN(vflush)(VT a) {
     VTU u = (VTU)a;
+#if defined(__aarch64__)
+    __asm__("" : "+w"(u));
+#else
     __asm__("" : "+x"(u));
+#endif
     VTU mag = u & ~((VTU){} + SGN);
     VTS den = (mag != 0) & ((u & EXPM) == 0);
     return (VT)FN(vsel)(den, u & SGN, u);

@@ -8,7 +8,6 @@
 // Design: Savage Wind Recomp #189 and LAS Recomp runtime/nvn/vulkan/record.c (https://github.com/peiikai/LASRecomp
 // @ a4b53a3, MIT, Copyright (c) 2026 Peiikai); the code is ours.
 #define VK_REC_IMPL
-#include <immintrin.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -75,7 +74,7 @@ static void rec_main(void *arg) {
     for (;;) {
         uint64_t h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
         if (t == h) {
-            for (int i = 0; i < 4096 && t == h; i++) _mm_pause(), h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
+            for (int i = 0; i < 4096 && t == h; i++) plat_pause(), h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
             if (t == h) {
                 __atomic_store_n(&Q.sleeping, 1, __ATOMIC_SEQ_CST);
                 h = __atomic_load_n(&Q.head, __ATOMIC_SEQ_CST);
@@ -115,7 +114,7 @@ static void wait_space(uint64_t need) {
     Q.pub_h = Q.put_h;
     __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
-    while (Q.put_h + need - (Q.tail_seen = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE)) > RING_WORDS) _mm_pause();
+    while (Q.put_h + need - (Q.tail_seen = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE)) > RING_WORDS) plat_pause();
 }
 
 // Room for a packet of bytes of arguments; the caller fills it and calls pub().
@@ -160,7 +159,7 @@ void rec_drain(void) {
     __atomic_store_n(&Q.head, Q.put_h, __ATOMIC_RELEASE);
     wake();
     for (int i = 0; __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE) != Q.put_h; i++)
-        if (i < 20000) _mm_pause();
+        if (i < 20000) plat_pause();
         else plat_yield();
     RS_.drains++, RS_.drain_ns += now_ns() - t0;
 }

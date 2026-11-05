@@ -179,8 +179,18 @@ static const char *missing_required(VkPhysicalDevice pd) {
     VkExtensionProperties *e = calloc(n ? n : 1, sizeof *e);
     vkEnumerateDeviceExtensionProperties(pd, NULL, &n, e);
     const char *miss = NULL;
-    for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext && !miss; i++)
-        if (!has_ext(e, n, k_required_ext[i])) miss = k_required_ext[i];
+    for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext && !miss; i++) {
+        if (has_ext(e, n, k_required_ext[i])) continue;
+#if defined(__linux__) && defined(__aarch64__)
+        if (!strcmp(k_required_ext[i], VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+            const char *mode = cfg_value("TOTK_MEMORY"), *shadow = cfg_get("TOTK_SHADOW");
+            if (strcmp(mode, "import") && !(shadow && !strcmp(shadow, "0"))) continue;
+            rt_log("vk: host import requested by %s, but %s is unavailable",
+                   !strcmp(mode, "import") ? "TOTK_MEMORY=import" : "TOTK_SHADOW=0", k_required_ext[i]);
+        }
+#endif
+        miss = k_required_ext[i];
+    }
     free(e);
     return miss;
 }
@@ -292,7 +302,9 @@ static int create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
     const char *ext[48];
     uint32_t n_ext = 0;
-    for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++) ext[n_ext++] = k_required_ext[i];
+    g_vk.has_external_memory_host = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    for (size_t i = 0; i < sizeof k_required_ext / sizeof *k_required_ext; i++)
+        if (has_ext(ep, ne, k_required_ext[i])) ext[n_ext++] = k_required_ext[i];
 
     FeatureChain *c = calloc(1, sizeof *c);
     void **tail = &c->f2.pNext;
@@ -423,10 +435,12 @@ static int create_device(void) {
     if (g_vk.xfer_family != g_vk.gfx_family) vkGetDeviceQueue(g_vk.device, g_vk.xfer_family, 0, &g_vk.xfer_queue);
     else { g_vk.xfer_queue = g_vk.gfx_queue; g_vk.xfer_shared = 1; }
 
-    VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
-    VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
-    vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
-    g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
+    if (g_vk.has_external_memory_host) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT emh = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &emh};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        g_vk.min_imported_host_alignment = (uint32_t)emh.minImportedHostPointerAlignment;
+    }
     vk_caps_init(&g_vk);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.device, .instance = g_vk.instance,

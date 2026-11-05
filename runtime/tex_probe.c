@@ -343,34 +343,47 @@ static int test_import(pool_t *pool) {
     vk_mem_gpu_pending(a + 0x1000, 0x20000);
     copy_wait(sb, 0, sp.buffer, sp.offset, 0x20000);
     vk_gpu_written(a + 0x1000, 0x20000);
-    GCHECK(!memcmp(m + 0x1000, s, 0x20000), "GPU copy into the imported heap range differs from the source");
+    if (memcmp(m + 0x1000, s, 0x20000)) {
+        vmaDestroyBuffer(c->vma, sb, sa);
+        GCHECK(0, "GPU copy into the imported heap range differs from the source");
+    }
     n = mem_written_pages(a, pool->size, pages, 64);
     g_gpu_seen = n;
-    printf("probe-vkmem: GPU copy of 128 KiB into the imported heap: equal; write watch reported %llu of 32 pages\n",
-           (unsigned long long)n);
+    if (n == UINT64_MAX)
+        printf("probe-vkmem: GPU copy of 128 KiB into the heap: equal; write watch untracked (page count N/A)\n");
+    else printf("probe-vkmem: GPU copy of 128 KiB into the imported heap: equal; write watch reported %llu of 32 pages\n",
+                (unsigned long long)n);
 
-    // CPU writes: reported exactly, and the GPU reads them through the same buffer
+    // CPU writes: page-exact when tracked; GPU reads must match either way.
     for (int i = 0; i < 0x4000; i++) m[0x30000 + i] = rnd8();
     n = mem_written_peek(a, pool->size, pages, 64);
-    GCHECK(n == 4 && pages[0] == a + 0x30000 && pages[3] == a + 0x33000, "CPU writes to 4 pages: %llu reported",
-           (unsigned long long)n);
+    int tracked = n != UINT64_MAX;
+    if (tracked && !(n == 4 && pages[0] == a + 0x30000 && pages[3] == a + 0x33000)) {
+        vmaDestroyBuffer(c->vma, sb, sa);
+        GCHECK(0, "CPU writes to 4 pages: %llu reported", (unsigned long long)n);
+    }
     vk_mem_resolve(a + 0x30000, 0x4000, &sp);
     vk_mem_shadow_sync();
     copy_wait(sp.buffer, sp.offset, sb, 0, 0x4000);
     vmaInvalidateAllocation(c->vma, sa, 0, VK_WHOLE_SIZE);
-    GCHECK(!memcmp(s, m + 0x30000, 0x4000), "GPU read of CPU-written heap differs");
+    int same = !memcmp(s, m + 0x30000, 0x4000);
     vmaDestroyBuffer(c->vma, sb, sa);
+    GCHECK(same, "GPU read of CPU-written heap differs");
 
-    // generations: written after `since` -> 1, then 0, explicit host write -> 1
+    // Tracked generations: CPU write -> 1, then 0, explicit write -> 1; untracked always requests a full upload.
     uint32_t g0, g1, g2, g3;
     vk_mem_changed(a, pool->size, 0, &g0);
     m[0x8000] = 1;
-    GCHECK(vk_mem_changed(a + 0x8000, 0x1000, g0, &g1) == 1, "a CPU write after a generation is not seen");
-    GCHECK(vk_mem_changed(a, pool->size, g1, &g2) == 0, "no write since the last generation is reported as written");
+    GCHECK(vk_mem_changed(a + 0x8000, 0x1000, g0, &g1) == (tracked ? 1 : -1), "%s",
+           tracked ? "a CPU write after a generation is not seen" : "untracked CPU write must request a full upload");
+    GCHECK(vk_mem_changed(a, pool->size, g1, &g2) == (tracked ? 0 : -1), "%s",
+           tracked ? "no write since the last generation is reported as written" : "untracked range must keep requesting full uploads");
     vk_guest_written(a + 0x9000, 4);
-    GCHECK(vk_mem_changed(a + 0x9000, 0x1000, g2, &g3) == 1, "an explicit guest_written range is not seen");
+    GCHECK(vk_mem_changed(a + 0x9000, 0x1000, g2, &g3) == (tracked ? 1 : -1), "%s",
+           tracked ? "an explicit guest_written range is not seen" : "untracked explicit write must request a full upload");
     GCHECK(vk_mem_changed(RT_KERNEL_BASE, 0x1000, 0, &g3) == -1, "the kernel region is reported as tracked");
-    printf("probe-vkmem: write watch: CPU writes reported page-exact; generations see CPU and explicit writes\n");
+    if (tracked) printf("probe-vkmem: write watch: CPU writes reported page-exact; generations see CPU and explicit writes\n");
+    else printf("probe-vkmem: write watch untracked: page-exact/generation tracking N/A; full-upload invalidation and CPU/GPU bytes checked\n");
     g_gpu_checks += 7;
     return 0;
 }
@@ -396,8 +409,11 @@ static int test_readfile(uint8_t *dst) {
         GCHECK(got == 0x2000 && !memcmp(p, data, sizeof data), "ReadFile (%s) result", k ? "unbuffered" : "buffered");
         g_rf_seen[k] = mem_written_pages((uintptr_t)p, 0x2000, pages, 8);
         g_rf_us[k] = (t1 - t0) / 1000;
-        printf("probe-vkmem: ReadFile %s of 8 KiB into a watched page: %llu us, write watch saw %llu of 2 pages\n",
-               k ? "unbuffered" : "buffered", (unsigned long long)g_rf_us[k], (unsigned long long)g_rf_seen[k]);
+        if (g_rf_seen[k] == UINT64_MAX)
+            printf("probe-vkmem: ReadFile %s of 8 KiB: bytes equal, %llu us, write watch untracked (page count N/A)\n",
+                   k ? "unbuffered" : "buffered", (unsigned long long)g_rf_us[k]);
+        else printf("probe-vkmem: ReadFile %s of 8 KiB into a watched page: %llu us, write watch saw %llu of 2 pages\n",
+                    k ? "unbuffered" : "buffered", (unsigned long long)g_rf_us[k], (unsigned long long)g_rf_seen[k]);
     }
     plat_file_delete(path);
     g_gpu_checks += 2;
@@ -456,7 +472,7 @@ static tex_t make_tex(pool_t *pool, uint64_t off, int format, uint32_t w, uint32
     t.magic = MAGIC('T', 'E', 'X', 0);
     t.d.target = 1, t.d.format = format, t.d.width = w, t.d.height = h, t.d.depth = 1, t.d.levels = levels;
     nvn_tex_layout(&t.d, &t.L);
-    t.pool = pool, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
+    t.pool = pool, t.pool_flags = (uint16_t)pool->flags, t.off = (int64_t)off, t.mem = pool->mem + off, t.serial = serial;
     return t;
 }
 
@@ -500,14 +516,17 @@ static int test_textures(pool_t *tpool, pool_t *phys) {
     GCHECK(img && img->mirrored && img->levels == 3 && img->format == VK_FORMAT_R8G8B8A8_UNORM, "RGBA8 texture image");
     for (unsigned lv = 0; lv < 3; lv++)
         if (read_back(&t, lv, lin, 1, "RGBA8")) return 1;
-    // CPU writes to the storage: write watch -> re-upload on the next use
-    uint64_t up0, re0, re1;
+    // CPU writes: re-upload once with tracking, or on every read without it.
+    uint64_t up0, re0, re1, pages[1];
+    int tracked = mem_written_peek((uintptr_t)t.mem, t.L.size, pages, 1) != UINT64_MAX;
     vk_texture_stats(NULL, &up0, &re0);
     if (fill_storage(&t, lin)) return 1;
     for (unsigned lv = 0; lv < 3; lv++)
         if (read_back(&t, lv, lin, 1, "RGBA8 rewritten")) return 1;
     vk_texture_stats(NULL, NULL, &re1);
-    GCHECK(re1 == re0 + 1, "storage rewritten: %llu re-uploads (want 1)", (unsigned long long)(re1 - re0));
+    unsigned want = tracked ? 1 : t.d.levels;
+    GCHECK(re1 == re0 + want, "storage rewritten: %llu re-uploads (want %u)", (unsigned long long)(re1 - re0), want);
+    if (!tracked) printf("probe-vkmem: texture page tracking N/A; full re-upload checked on each of %u level reads\n", want);
     if (read_back(&t, 1, lin, 0, "RGBA8 ReadTexels from storage")) return 1;
 
     // BC1, 64x48: blocks uploaded as they are, read back from the image
@@ -593,6 +612,12 @@ int probe_vkmem(void) {
     if (bad || errors) {
         printf("probe-vkmem: FAILED (%s, %ld validation errors)\n", bad ? "a GPU check failed" : "GPU checks passed", errors);
         return 1;
+    }
+    if (g_gpu_seen == UINT64_MAX || g_rf_seen[0] == UINT64_MAX || g_rf_seen[1] == UINT64_MAX) {
+        printf("probe-vkmem: passed (%u deswizzle cases, %u astc blocks, %u formats mapped, %u GPU checks, "
+               "write-watch counts N/A for untracked ranges (see above), 0 validation errors)\n",
+               g_cases, g_astc_blocks, n_mapped, g_gpu_checks);
+        return 0;
     }
     printf("probe-vkmem: passed (%u deswizzle cases, %u astc blocks, %u formats mapped, %u GPU checks, GPU writes seen by "
            "write watch %llu/32 pages, ReadFile seen %llu/2 buffered and %llu/2 unbuffered, 0 validation errors)\n",

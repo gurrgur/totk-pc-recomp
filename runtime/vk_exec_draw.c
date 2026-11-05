@@ -15,6 +15,7 @@
 // 9365-9488, 9489-9921, 10013-10079 @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the uniform-buffer spans, texture and
 // sampler descriptor lookups and the dispatch flow follow LAS Recomp runtime/nvn/vulkan/exec.c:1851-1908, 2300-2516
 // @ da35b83a (MIT, Copyright (c) 2026 Peiikai). The support buffer layout is Ryujinx's SupportBuffer.cs (MIT).
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -2706,6 +2707,14 @@ static int mo_similar(const uint8_t *cur, const uint8_t *old, uint64_t n, int *c
     return 1;
 }
 
+#if defined(__aarch64__)
+#define mo_counter() plat_now_ns()
+#define MO_COUNTER_UNIT "ns"
+#else
+#define mo_counter() __builtin_ia32_rdtsc()
+#define MO_COUNTER_UNIT "cycles"
+#endif
+
 // Last frame's copy of a block, accepted when it is this frame's block a little changed (mo_similar,
 // which see): a block of another object the address rule found would make motion up. 1 and *out: found (the block itself
 // when it is unchanged, *changed 0); 0: none, the draw keeps this frame's block there.
@@ -2727,15 +2736,15 @@ static int mo_prev_block(int index, const p_bind_buf *u, VkDescriptorBufferInfo 
         skip = e && *e ? strtol(e, NULL, 16) : 1L << 9 | 1L << 11;
     }
     if (skip >> (index + 3) & 1) return 0;
-    uint64_t c0 = __builtin_ia32_rdtsc();
+    uint64_t c0 = mo_counter();
     int found = vk_mvprev_find(index, u->addr, u->size, &pa, &how);
-    uint64_t c1 = __builtin_ia32_rdtsc();
+    uint64_t c1 = mo_counter();
     MO.cyc[0] += c1 - c0, MO.ncyc++, MO.big += n;
     if (index >= 0 && index < 14) MO.lk[index][found ? how : MVPREV_NONE]++;
     if (!found || !vk_usnap_find(pa, n, LIM.ubo_align, out)) return 0;
     if (how == MVPREV_SELF) return 1;   // bound at the same address last frame: not written again
     const uint8_t *map = vk_usnap_map(), *cur = vk_usnap_bytes(u->addr, n);
-    uint64_t c2 = __builtin_ia32_rdtsc();
+    uint64_t c2 = mo_counter();
     MO.cyc[1] += c2 - c1;
     if (!cur) return 0;
     const uint8_t *old = map + out->offset;
@@ -2749,7 +2758,7 @@ static int mo_prev_block(int index, const p_bind_buf *u, VkDescriptorBufferInfo 
         return 1;
     }
     int r = mo_similar(cur, old, n, changed);
-    MO.cyc[2] += __builtin_ia32_rdtsc() - c2;
+    MO.cyc[2] += mo_counter() - c2;
     if (!r && index >= 0 && index < 14) MO.lk[index][4]++;
     return r;
 }
@@ -3027,7 +3036,7 @@ int vk_mvobj_execute(VkExec *ex, uint64_t cam, VkImageView mv, VkImageView depth
                MO.ns_part[1] / 1e6 / frames, (double)MO.n_part[1] / frames, MO.ns_part[2] / 1e6 / frames,
                (double)MO.n_part[2] / frames, (double)MO.misses / frames, MO.ns_still / 1e6 / frames);
     if (frames % 60 == 0 && MO.ncyc)
-        rt_log("vk_exec: per-object motion lookups: %llu cycles finding last frame's, %llu the copies, %llu comparing, "
+        rt_log("vk_exec: per-object motion lookups: %llu " MO_COUNTER_UNIT " finding last frame's, %llu the copies, %llu comparing, "
                "a lookup; %llu bytes a lookup", (unsigned long long)(MO.cyc[0] / MO.ncyc),
                (unsigned long long)(MO.cyc[1] / MO.ncyc), (unsigned long long)(MO.cyc[2] / MO.ncyc),
                (unsigned long long)(MO.big / MO.ncyc));

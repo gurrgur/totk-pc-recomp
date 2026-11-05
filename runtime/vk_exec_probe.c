@@ -872,9 +872,10 @@ static int test_nvnx(const GfxBackend *b, uint8_t *guest, int *bytes) {
 // VRAM mirror (vk_memory.c; skipped in import mode): a pool given its mirror as on a first buffer use, after which
 // buffer copies and fills read and write the mirror. The first use copies the whole pool; CPU writes between
 // submissions reach the mirror through write watch; GPU writes reach guest memory by the fence, and only the bytes
-// written: CPU bytes beside a GPU fill keep their values.
-static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
-    *bytes = 0;
+// written: CPU bytes beside a GPU fill keep their values. Untracked backing runs the same byte checks without
+// claiming VRAM-mirror or tracked upload-byte coverage.
+static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes, int *mirrored) {
+    *bytes = 0, *mirrored = 0;
     if (!vk_mirror_on) return 0;
     pool_t pool = {.magic = NVN_POOL_MAGIC, .flags = 0x22, .mem = guest + 0xC00000, .size = 0x100000,
                    .game_mem = guest + 0xC00000};
@@ -882,7 +883,15 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     uint8_t *m = pool.mem;
     for (int i = 0; i < 4096; i++) m[i] = (uint8_t)(i * 13 + 1);
     memset(m + 0x1000, 0xEE, 0x5000);
-    CHECK(vk_mem_mirror_probe((uint64_t)(uintptr_t)m), "the pool got no VRAM mirror");
+    uint64_t pages[1];
+    int untracked = mem_written_peek((uint64_t)(uintptr_t)m, pool.size, pages, 1) == UINT64_MAX;
+    *mirrored = vk_mem_mirror_probe((uint64_t)(uintptr_t)m);
+    CHECK(*mirrored || untracked, "the pool got no VRAM mirror");
+    if (!*mirrored) {
+        VkMemSpan sp;
+        CHECK(vk_mem_resolve((uint64_t)(uintptr_t)m, pool.size, &sp) && sp.buffer,
+              "the untracked pool has no CPU-visible fallback buffer");
+    }
     static _Alignas(8) uint8_t stream[1024];
     uint64_t a = (uint64_t)(uintptr_t)m;
     // 1: B2B in the mirror after its first-use copy, and a fill; both written back.
@@ -928,7 +937,7 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
     // A submission's copies reach the counter with the next one, and c4's own write-back adds its destination page.
     CHECK(xf_submit(b, stream, p), "fence_wait of the mirror submission that counts the flushes timed out");
     uint64_t up = vk_mem_mirror_uploaded() - up0;
-    if (!rt_knob("FLUSH_SPAN", "0"))
+    if (*mirrored && !rt_knob("FLUSH_SPAN", "0"))
         CHECK(up >= 0x2000 && up < 0x10000, "two flushed pages copied %#llx bytes, 0xeb000 would be the span",
               (unsigned long long)up);
     b->pool_fini(&pool);
@@ -979,9 +988,9 @@ int probe_vkexec(void) {
     if (!bad) bad = test_xfer(b, guest, &xfer_bytes);
     int zero_bytes = 0;
     if (!bad) bad = test_c0() || test_zero(b, guest, &zero_bytes);
-    int nvnx_bytes = 0, mirror_bytes = 0;
+    int nvnx_bytes = 0, mirror_bytes = 0, mirrored = 0;
     if (!bad) bad = test_nvnx(b, guest, &nvnx_bytes);
-    if (!bad) bad = test_mirror(b, guest, &mirror_bytes);
+    if (!bad) bad = test_mirror(b, guest, &mirror_bytes, &mirrored);
     if (!bad) bad = test_empty_pool(b, guest);
     b->finish();
     vk_pipeline_shutdown();   // the pipelines and the draw part's stand-ins go before the device
@@ -1022,9 +1031,12 @@ int probe_vkexec(void) {
     printf("probe-vkexec: c0 and zero parts passed (c0 tables, dispatch size, point size and base instance at their offsets, "
            "unbound slots zero; %d bytes of an unwritten physical-pool texture read zero, TOTK_FIX_ZERO=%s)\n",
            zero_bytes, cfg_value("TOTK_FIX_ZERO"));
-    if (vk_mirror_on)
+    if (mirrored)
         printf("probe-vkexec: mirror part passed (B2B and fill in a VRAM mirror written back by the fence, a CPU write "
                "between submissions mirrored, CPU bytes beside a fill kept, %d bytes compared)\n", mirror_bytes);
+    else if (vk_mirror_on)
+        printf("probe-vkexec: CPU-visible fallback part passed (untracked backing; B2B, fill, CPU rewrite and CPU bytes "
+               "beside a fill kept, %d bytes compared); VRAM-mirror and tracked upload-byte coverage N/A\n", mirror_bytes);
     else
         printf("probe-vkexec: mirror part skipped (memory mode import)\n");
     if (marks_skipped)
