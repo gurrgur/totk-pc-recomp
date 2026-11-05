@@ -2085,6 +2085,20 @@ static void bind_vertex_buffers(VkExec *ex) {
     // (vk_mem_gen, read before any resolve), resolves to that buffer again: most draws change one stream or none.
     uint64_t gen = vk_mem_gen();
     int same_gen = B.vb_valid && B.vgen == gen;
+    // Every stream the draw reads resolved last time, with the same range and stride, and no pool or mirror change
+    // since: the bindings stay as they are. The ranges of the streams it does not read are still recorded, as the
+    // full path below records them.
+    uint32_t want = used & VK_PIPE_ALL_BINDINGS & ~(1u << VK_PIPE_ZERO_BINDING);
+    if (same_gen && B.vres == want) {
+        int b = 0;
+        for (; b < 16; b++)
+            if (((want >> b & 1) && (B.vin[b].address != ex->vbuf[b].address || B.vin[b].size != ex->vbuf[b].size)) ||
+                (!dyn && B.vstr[b] != ex->pipe.vstream[b].stride)) break;
+        if (b == 16) {
+            memcpy(B.vin, ex->vbuf, sizeof B.vin);
+            return;
+        }
+    }
     uint32_t res = 0;
     for (int b = 0; b < 17; b++) {
         vb[b] = Z.zbuf, vo[b] = 0, vsz[b] = ZERO_BYTES, vstr[b] = b < 16 ? ex->pipe.vstream[b].stride : 0;
