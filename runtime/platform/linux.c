@@ -150,9 +150,29 @@ static void alt_stack(void) {
     sigaltstack(&ss, NULL);
 }
 
+static int boost_floor;   // uclamp_min of boosted threads, 0..1024; 0 when off
+
+// sched_setattr with only the utilisation clamp changed: SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS |
+// SCHED_FLAG_UTIL_CLAMP_MIN. glibc has no wrapper; the struct is the kernel's sched_attr (version 1, 56 bytes).
+static void uclamp_min(uint32_t v) {
+    struct { uint32_t size, policy; uint64_t flags; int32_t nice; uint32_t prio; uint64_t runtime, deadline, period;
+             uint32_t util_min, util_max; } a = {.size = 56, .flags = 0x08 | 0x10 | 0x20, .util_min = v};
+    _Static_assert(sizeof a == 56, "sched_attr version 1");
+    syscall(SYS_sched_setattr, 0, &a, 0);   // fails without CONFIG_UCLAMP_TASK: the clock stays the governor's
+}
+
+void plat_thread_boost_level(int pct) {
+    boost_floor = pct <= 0 ? 0 : pct >= 100 ? 1024 : pct * 1024 / 100;
+}
+
+void plat_thread_boost(void) {
+    if (boost_floor) uclamp_min((uint32_t)boost_floor);
+}
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
     alt_stack();
+    if (boost_floor) uclamp_min(0);   // a new thread inherits its creator's floor; only plat_thread_boost gives one
     __atomic_store_n(&t->tid, (int32_t)syscall(SYS_gettid), __ATOMIC_RELEASE);
     if (t->name[0]) pthread_setname_np(pthread_self(), t->name);
     t->fn(t->arg);

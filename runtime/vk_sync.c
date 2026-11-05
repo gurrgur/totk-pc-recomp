@@ -251,6 +251,7 @@ WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint
 
 static void completion_main(void *arg) {
     VkCtx *c = arg;
+    plat_thread_boost();
     plat_mutex_lock(&st_lock);
     for (;;) {
         while (!stop && done == issued && !(qn && queue[qhead].fence <= done))

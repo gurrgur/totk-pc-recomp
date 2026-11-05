@@ -96,6 +96,13 @@ enum { PLAT_PRIO_IDLE = -15, PLAT_PRIO_LOWEST = -2, PLAT_PRIO_BELOW_NORMAL = -1,
 void plat_thread_priority(int prio);
 void plat_thread_set_priority(PlatThread *t, int prio);
 int plat_thread_priority_get(void);       // the calling thread's level
+// Clock floor for the threads a frame waits on. On Linux the CPU clock follows how busy each core looks (schedutil),
+// and the game's threads hand work to each other, so none looks busy and the clock stays low until a load spike has
+// already cost frames. plat_thread_boost_level sets, once before threads start, the floor in percent of the fastest
+// core's capacity; plat_thread_boost gives it to the calling thread (uclamp_min, which needs no privilege and stays
+// below the clock limits the system sets). Threads start without it. 0, and Windows, do nothing.
+void plat_thread_boost_level(int pct);
+void plat_thread_boost(void);
 void plat_yield(void);                    // gives the rest of the time slice to another ready thread
 static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)

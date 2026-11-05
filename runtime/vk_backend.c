@@ -201,6 +201,7 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
 static void replay_main(void *arg) {
     (void)arg;
     perf_replay_thread();
+    plat_thread_boost();
     plat_mutex_lock(&rl);
     for (;;) {
         while (!rq_n) plat_cond_wait(&rcv, &rl);

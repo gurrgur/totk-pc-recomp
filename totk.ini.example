@@ -44,6 +44,11 @@
 # free_cores = 0
 # Windows timer resolution of 1 ms for steadier frame pacing (0 = the Windows default).
 # timer_1ms = 1
+# Linux: clock floor, in percent of the fastest core, for the threads a frame waits on (game, recording, audio).
+# The game's threads hand work to each other, so no core looks busy and a governor such as schedutil keeps the clock
+# low until a load spike has already cost frames. 0 leaves the clock to the governor. It never raises the clock
+# limits the system sets. Windows ignores it.
+# cpu_boost = 50
 
 # Shaders and pipelines.
 # Draws whose pipeline is still building: default waits on a reserved worker; draw is the previous scheduling.

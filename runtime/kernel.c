@@ -1530,6 +1530,7 @@ static void thread_main(void *p) {
     RtThread *t = p;
     tcur = t;
     t->tid = plat_thread_id();
+    plat_thread_boost();
     PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
@@ -1603,6 +1604,7 @@ void kern_main_stack(uint64_t *base, uint64_t *size) {
 static void guest_main(void *p) {
     void (*fn)(Cpu *) = (void (*)(Cpu *))p;
     Cpu *c;
+    plat_thread_boost();
     kern_main_thread(&c);
     if (!plat_jmp_save(&tcur->exit_jmp)) fn(c);
     thread_finish(tcur);
