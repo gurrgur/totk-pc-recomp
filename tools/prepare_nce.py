@@ -242,6 +242,29 @@ def emit_module(name, base, nso, sites, arena, patch_page, interiors):
             site.update(resume=0, entry=0)
             result.append(site)
             continue
+        if site['operation'] in (READ_TP, READ_TPRO, FREQUENCY, CONSTANT):
+            reg = site['original'] & 31
+            if reg == 31:
+                body = [NOP]
+            elif site['operation'] in (READ_TP, READ_TPRO):
+                # Fresh destination-only pointer chasing follows frame rebinding without reserving a register.
+                load = 0xf9400000 | (reg << 5) | reg
+                field = 280 if site['operation'] == READ_TP else 288
+                body = [0xd53bd040 | reg, 0x91400000 | (reg << 5) | reg,
+                        0x91000000 | (reg << 5) | reg, load, load, load | ((field // 8) << 10)]
+            else:
+                value = site['argument']
+                body = [0xd2800000 | ((value & 0xffff) << 5) | reg]
+                body += [0xf2800000 | ((shift // 16) << 21) | (((value >> shift) & 0xffff) << 5) | reg
+                         for shift in (16, 32, 48) if (value >> shift) & 0xffff]
+            if len(body) == 1:
+                site.update(operation=WORD, argument=body[0], entry=0, resume=0)
+            else:
+                site.update(entry=cursor, resume=0)
+                put(cursor, body + [branch(cursor + len(body) * 4, pc + 4)])
+                cursor = layout.align_up(cursor + (len(body) + 1) * 4, 16)
+            result.append(site)
+            continue
         if site['operation'] == CAPSULE:
             load, cmp, cond, store = site['capsule']
             body = leaf_stub(cursor, pc, load, EXLOAD)[:10]
@@ -414,7 +437,7 @@ def generate(exefs, out, expected, patch_path=None):
         off, length = images[name].text
         counts = {op: sum(s['operation'] == op for s in sites) for op in (EXLOAD, EXSTORE, CLEAR, CAPSULE, INTERIOR)}
         print(f'{name}: sites={len(sites)}, arena={arena_size} bytes, leaf exclusives={counts}, '
-              f'C gates={sum(s["operation"] not in (EXLOAD, EXSTORE, CLEAR, CAPSULE, WORD) for s in sites)}')
+              f'C gates={sum(s["operation"] not in (EXLOAD, EXSTORE, CLEAR, CAPSULE, WORD, READ_TP, READ_TPRO, FREQUENCY, CONSTANT) for s in sites)}')
         descriptions.append(f' {{"{name}", "{hashes[name]}", {base:#x}ull, {size:#x}ull, {off:#x}, {length:#x}, {arena:#x}ull, '
                             f'{arena_size:#x}, {name}_sites, {len(sites)}, {name}_words, {len(packed)} }},')
     lines += ['const NceModule rt_nce_modules[] = {', *descriptions, '};',

@@ -40,6 +40,9 @@ static void qualify_host(void) {
     }
 }
 
+_Static_assert(offsetof(NceFrame, cpu) == 0, "native leaf CPU");
+_Static_assert(offsetof(Cpu, tpidr) == 280, "native leaf virtual TP");
+_Static_assert(offsetof(Cpu, tpidrro) == 288, "native leaf virtual TPRO");
 _Static_assert(offsetof(NceFrame, return_sp) == 16, "native host SP");
 _Static_assert(offsetof(NceFrame, service_sp) == 24, "native service SP");
 _Static_assert(offsetof(NceFrame, host_fpcr) == 32, "native host FPCR");
@@ -153,6 +156,9 @@ void rt_nce_load(const char *name, uint64_t base, uint64_t size) {
         if (s->operation == NCE_CLREX) { offsets[0] = 16; n = 1; }
         if (s->operation == NCE_EXSTORE) { offsets[0] = 4; offsets[1] = 40; n = 2; }
         if (s->operation == NCE_CAPSULE) { offsets[0] = 12; n = 1; }
+        if ((s->operation == NCE_READ_TP || s->operation == NCE_READ_TPRO) && !s->resume) {
+            offsets[0] = 4; n = 1;
+        }
         for (unsigned j = 0; j < n; j++) {
             uint64_t a = s->entry + offsets[j];
             ST32(a, LD32(a) | ((uint32_t)(tls >> 12) << 10));

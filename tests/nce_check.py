@@ -19,10 +19,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / 'tools'), str(ROOT / 'recomp')]
 import prepare_nce as n
 import patches
-from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE
+from unicorn import Uc, UC_ARCH_ARM64, UC_MODE_ARM, UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
 from unicorn import arm64_const as r
 
-TEXT, ARENA, TLS, FRAME, STACK, DATA, BRIDGE = 0x100000, 0x200000, 0x300000, 0x301000, 0x500000, 0x600000, 0x700000
+TEXT, ARENA, TLS, FRAME, CPU, STACK, DATA, BRIDGE = 0x100000, 0x200000, 0x300000, 0x301000, 0x302000, 0x500000, 0x600000, 0x700000
 
 
 def assemble(text):
@@ -52,10 +52,10 @@ def plan(code, table=None):
     return output, arena
 
 
-def machine(code, table=None):
+def machine(code, table=None, tls_offset=16):
     sites, arena = plan(code, table)
     u = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
-    for address, size in ((TEXT, 0x10000), (ARENA, 0x10000), (TLS, 0x10000), (STACK, 0x10000), (DATA, 0x10000), (BRIDGE, 0x1000)):
+    for address, size in ((TEXT, 0x10000), (ARENA, 0x10000), (TLS, n.layout.align_up(tls_offset + 0x10000, 0x1000)), (STACK, 0x10000), (DATA, 0x10000), (BRIDGE, 0x1000)):
         u.mem_map(address, size)
     u.mem_write(TEXT, struct.pack('<' + 'I' * len(code), *code))
     for pc, w in arena:
@@ -67,14 +67,18 @@ def machine(code, table=None):
             continue
         if s['resume']:
             u.mem_write(s['resume'] - 8, struct.pack('<Q', BRIDGE))
-        # Independent test relocation: static TLS variable at TP + 16.
-        starts = {n.EXLOAD: (12,), n.EXSTORE: (4, 40), n.CLEAR: (16,), n.CAPSULE: (12,)}.get(op, ())
+        # Relocate both static-TLS ADD immediates to the test's TLS offset, as the loader does.
+        starts = {n.EXLOAD: (12,), n.EXSTORE: (4, 40), n.CLEAR: (16,), n.CAPSULE: (12,),
+                  n.READ_TP: (4,), n.READ_TPRO: (4,)}.get(op, ())
         for offset in starts:
-            addr = entry + offset + 4
-            value = struct.unpack('<I', u.mem_read(addr, 4))[0]
-            u.mem_write(addr, struct.pack('<I', value | (16 << 10)))
+            for delta, value in ((0, tls_offset >> 12), (4, tls_offset & 4095)):
+                addr = entry + offset + delta
+                word = struct.unpack('<I', u.mem_read(addr, 4))[0]
+                u.mem_write(addr, struct.pack('<I', word | (value << 10)))
         u.mem_write(s['pc'], struct.pack('<I', n.branch(s['pc'], entry)))
-    u.mem_write(TLS + 16, struct.pack('<Q', FRAME))
+    u.mem_write(TLS + tls_offset, struct.pack('<Q', FRAME))
+    u.mem_write(FRAME, struct.pack('<Q', CPU))
+    u.mem_write(CPU + 280, struct.pack('<QQ', 0x9988776655443322, 0x1122334455667788))
     u.mem_write(FRAME + 80, struct.pack('<I', 2))
     u.reg_write(r.UC_ARM64_REG_TPIDR_EL0, TLS)
     u.reg_write(r.UC_ARM64_REG_SP, STACK + 0x8000)
@@ -140,7 +144,7 @@ def fixture(out):
                   '1: stlxr w10, w0, [x8]\nret')
     words32[3] = (words32[3] & ~(31 << 16)) | (31 << 16)
     struct.pack_into('<I', image, 0x24c, words32[3])
-    put(0x300, 'svc #0x79\nret')
+    put(0x300, 'svc #0x79\nmrs x16, tpidr_el0\nmrs x17, tpidrro_el0\nmrs x18, cntfrq_el0\nsvc #0x7b\nret')
     put(0x340, 'ldaxr x9, [x8]\nsvc #0x7a\nstlxr w10, x0, [x8]\nret')
     put(0x380, 'ldaxr x9, [x8]\nsvc #0x7a\nldaxr x9, [x8]\nstlxr w10, x0, [x8]\nret')
     put(0x400, 'ldaxr x9, [x8]\nmov w10, #1\nstlr w10, [x11]\n'
@@ -161,6 +165,14 @@ def fixture(out):
     put(0xb40, '1: ldaxr x9, [x8]\ncmp x9, x1\nb.ne 1b\nstlxr w10, x0, [x8]\ncbnz w10, 1b\nret')
     put(0xb80, '1: cbz x1, 2f\nsub x1, x1, #1\nb 1b\n2: ret')
     put(0xc00, 'wfe\nret')
+    put(0xc40, 'mrs x0, tpidr_el0\nmrs x1, tpidrro_el0\nmrs x16, cntfrq_el0\n'
+               'mrs x17, ctr_el0\nmrs x18, dczid_el0\nmrs xzr, tpidr_el0\n'
+               'mrs xzr, tpidrro_el0\nmrs xzr, cntfrq_el0\nmrs xzr, dczid_el0\nmrs xzr, ctr_el0\nret')
+    put(0xc80, 'msr tpidr_el0, x0\nmrs x0, tpidr_el0\nmrs x1, tpidrro_el0\nret')
+    put(0xcc0, 'stp x29, x30, [sp, #-16]!\nmrs x30, tpidr_el0\nmov x0, x30\n'
+               'mrs x30, tpidrro_el0\nmov x1, x30\nldp x29, x30, [sp], #16\nret')
+    put(0xd00, '1: ldaxr x9, [x8]\nmrs x16, tpidr_el0\nmrs x17, tpidrro_el0\n'
+               'mrs x18, dczid_el0\nstlxr w10, x0, [x8]\ncbnz w10, 1b\nret')
     raw = bytearray(0x100) + image
     raw[:4] = b'NSO0'
     for i in range(3):
@@ -464,6 +476,124 @@ class NativeChecks(unittest.TestCase):
             self.assertIsNotNone(n.operation(w))
         for w in assemble('msr tpidrro_el0, x0\nmsr sctlr_el1, x0\nwfi'):
             with self.assertRaises(ValueError): n.operation(w)
+
+
+class LeafChecks(unittest.TestCase):
+    """Reads of TPIDR_EL0, TPIDRRO_EL0 and the constant system registers run as native leaves: full register state
+    kept, nothing stored, no bridge call, and the TLS binding read fresh each time."""
+    def watch(self, u):
+        reads, writes, calls = [], [], []
+        u.hook_add(UC_HOOK_MEM_READ, lambda uc, access, address, size, value, arg: reads.append(address))
+        u.hook_add(UC_HOOK_MEM_WRITE, lambda uc, access, address, size, value, arg: writes.append(address))
+        def code(uc, pc, size, arg):
+            if pc == BRIDGE:
+                calls.append(pc)
+                uc.emu_stop()
+        u.hook_add(UC_HOOK_CODE, code)
+        return reads, writes, calls
+
+    def test_every_destination_preserves_full_state_without_stores_or_bridge(self):
+        classes = (('tpidr_el0', 0x9988776655443322), ('tpidrro_el0', 0x1122334455667788),
+                   ('cntfrq_el0', 19200000), ('dczid_el0', 4), ('ctr_el0', 0x8444c004))
+        for system, expected in classes:
+            code = assemble('\n'.join(f'mrs {"x" + str(i) if i < 31 else "xzr"}, {system}' for i in range(32)))
+            for dest, word in enumerate(code):
+                for reservation in (0, 1, 2):
+                    with self.subTest(system=system, dest=dest, reservation=reservation):
+                        offset = 0x123450
+                        u, sites = machine([word], tls_offset=offset)
+                        for i in range(31):
+                            u.reg_write(getattr(r, f'UC_ARM64_REG_X{i}'), 0xfedcba9800000000 + i)
+                        if dest == 31:
+                            u.mem_write(TLS + offset, bytes(8)) # Discarded reads must not chase any pointer.
+                        u.mem_write(FRAME + 80, struct.pack('<I', reservation))
+                        before = snapshot(u)
+                        memory = bytes(u.mem_read(FRAME, 128)) + bytes(u.mem_read(CPU, 1024))
+                        reads, writes, calls = self.watch(u)
+                        u.emu_start(TEXT, TEXT + 4, count=16)
+                        self.assertEqual(u.reg_read(r.UC_ARM64_REG_PC), TEXT + 4)
+                        self.assertFalse(writes or calls)
+                        self.assertEqual(len(reads), 3 if system.startswith('tpidr') and dest != 31 else 0)
+                        self.assertEqual(bytes(u.mem_read(FRAME, 128)) + bytes(u.mem_read(CPU, 1024)), memory)
+                        if dest != 31:
+                            before[getattr(r, f'UC_ARM64_REG_X{dest}')] = expected
+                        self.assertEqual(snapshot(u), before)
+                        site = sites[0]
+                        self.assertEqual(site['resume'], 0)
+                        if dest == 31 or system == 'dczid_el0':
+                            self.assertEqual(site['operation'], n.WORD)
+                        else:
+                            self.assertTrue(ARENA <= site['entry'] < ARENA + 64)
+
+    def test_destination_only_tls_words_match_assembler(self):
+        for system, field in (('tpidr_el0', 280), ('tpidrro_el0', 288)):
+            for dest in range(31):
+                reg = f'x{dest}'
+                expected = assemble(f'mrs {reg}, tpidr_el0\nadd {reg}, {reg}, #0, lsl #12\n'
+                                    f'add {reg}, {reg}, #0\nldr {reg}, [{reg}]\nldr {reg}, [{reg}]\n'
+                                    f'ldr {reg}, [{reg}, #{field}]')
+                sites, arena = plan(assemble(f'mrs {reg}, {system}'))
+                entry = sites[0]['entry']
+                words = dict(arena)
+                self.assertEqual([words[entry + i * 4] for i in range(6)], expected)
+                self.assertEqual(n.direct_target(words[entry + 24], entry + 24), TEXT + 4)
+
+    def test_fields_frames_and_host_thread_binding_are_fresh(self):
+        offset = 0x123450
+        code = assemble('mrs x16, tpidr_el0\nmrs x17, tpidrro_el0')
+        u, _ = machine(code, tls_offset=offset)
+        _, writes, calls = self.watch(u)
+        for host, frame, cpu, tp, tpro in (
+                (TLS, FRAME, CPU, 11, 22),
+                (TLS, FRAME, CPU, 33, 44),
+                (TLS, TLS + 0x5000, TLS + 0x6000, 55, 66),
+                (TLS + 0x4000, FRAME, CPU, 77, 88),
+                (TLS, FRAME, CPU, 99, 111)):
+            u.reg_write(r.UC_ARM64_REG_TPIDR_EL0, host)
+            u.mem_write(host + offset, struct.pack('<Q', frame))
+            u.mem_write(frame, struct.pack('<Q', cpu))
+            u.mem_write(cpu + 280, struct.pack('<QQ', tp, tpro))
+            before = snapshot(u)
+            u.emu_start(TEXT, TEXT + 8, count=32)
+            self.assertEqual(u.reg_read(r.UC_ARM64_REG_PC), TEXT + 8)
+            before[r.UC_ARM64_REG_X16], before[r.UC_ARM64_REG_X17] = tp, tpro
+            self.assertEqual(snapshot(u), before)
+        self.assertFalse(writes or calls)
+
+    def test_pure_reads_do_not_consume_reservation_and_retry_makes_progress(self):
+        for system in ('tpidr_el0', 'tpidrro_el0', 'cntfrq_el0', 'dczid_el0', 'ctr_el0'):
+            for dest in ('x16', 'xzr'):
+                code = assemble(f'1: ldaxr x9, [x8]\nmrs {dest}, {system}\n'
+                                'stlxr w10, x0, [x8]\ncbnz w10, 1b')
+                for interrupt in (False, True):
+                    u, _ = machine(code)
+                    _, _, calls = self.watch(u)
+                    u.emu_start(TEXT, TEXT + 8, count=100)
+                    self.assertEqual(int.from_bytes(u.mem_read(FRAME + 80, 4), 'little'), 1)
+                    if interrupt:
+                        u.mem_write(TEXT + 0x100, struct.pack('<I', 0xd5033f5f))
+                        u.emu_start(TEXT + 0x100, TEXT + 0x104, count=1)
+                    u.emu_start(TEXT + 8, TEXT + 16, count=300)
+                    self.assertFalse(calls)
+                    self.assertEqual(u.reg_read(r.UC_ARM64_REG_X10), 0)
+                    self.assertEqual(int.from_bytes(u.mem_read(DATA, 8), 'little'), 0x1122334455667788)
+                    self.assertEqual(int.from_bytes(u.mem_read(FRAME + 80, 4), 'little'), 0)
+
+    def test_leaf_return_branch_range_is_checked(self):
+        for word in assemble('mrs x16, tpidr_el0\nmrs x17, cntfrq_el0'):
+            nso = SimpleNamespace(text=(0, 4), size=0x1000, image=struct.pack('<I', word), syms=[])
+            _, sites = n.plan_module('main', TEXT, nso, patches.Table())
+            with self.assertRaisesRegex(ValueError, 'native branch out of range'):
+                n.emit_module('main', TEXT, nso, sites, TEXT + (1 << 28), 0, set())
+
+    def test_nonleaf_operations_keep_full_boundaries(self):
+        code = assemble('msr tpidr_el0, x0\nmrs x1, cntvct_el0\nmrs x2, cntpct_el0\n'
+                        'svc #1\ndc civac, x0\ndc zva, x0\nmov w3, #3')
+        table = patches.Table([('test', 'TEST', 0)], {'main': {24: [(0, [n.NOP], code[-1])]}})
+        sites, _ = plan(code, table)
+        self.assertEqual([s['operation'] for s in sites],
+                         [n.WRITE_TP, n.TICKS, n.TICKS, n.SVC, n.CACHE, n.ZERO, n.PATCH])
+        self.assertTrue(all(s['entry'] and s['resume'] for s in sites))
 
 
 class PreparationChecks(unittest.TestCase):

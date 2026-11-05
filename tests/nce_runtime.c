@@ -169,8 +169,10 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     check_host();
     svcs++;
     if (imm == 0x77) {
+        assert(c->x[18] == c->tpidr);
         for (unsigned i = 0; i < 32; i++) c->v[i] = ((__uint128_t)(i + 1) << 100) | (1234 + i);
         c->tpidr = 0x9988;
+        c->tpidrro = 0x8877665544332211ull;
         c->fpcr = 0x1c00000;
         c->fpsr = 0x800009f;
         c->nzcv = 0xa0000000;
@@ -184,14 +186,31 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
             check_host();
             rt_nce_bind(c);
             assert(libc_tls == 0x12345678 && c->nce_frame == rt_nce_current);
-            fiber_stage = 2;
-            plat_fiber_switch(base_fiber);
-            rt_fatal("finished fixture fiber resumed");
+            c->tpidr = 0x123456789abcdef0ull;
+            c->tpidrro = 0xfedcba9876543210ull;
+            return; // Resume native reads on the migrated thread before its next C boundary.
         }
         longjmp(exit_target, 1);
+    } else if (imm == 0x7b) {
+        assert(guest_fiber && fiber_stage == 1);
+        assert(c->x[16] == c->tpidr && c->x[17] == c->tpidrro && c->x[18] == 19200000);
+        assert(c->nce_frame == rt_nce_current && libc_tls == 0x12345678);
+        fiber_stage = 2;
+        plat_fiber_switch(base_fiber);
+        rt_fatal("finished fixture fiber resumed");
     } else {
         assert(imm == 0x7a);
     }
+}
+
+static void leaf_values(Cpu *c) {
+    uint64_t tp = c->tpidr, tpro = c->tpidrro;
+    NceFrame *outer = c->nce_frame;
+    assert(rt_call(c, FIXTURE_BASE + 0xc40, 0) == tp);
+    assert(c->x[1] == tpro && c->x[16] == 19200000 && c->x[17] == 0x8444c004 && c->x[18] == 4);
+    assert(rt_call(c, FIXTURE_BASE + 0xcc0, 0) == tp && c->x[1] == tpro);
+    assert(c->nce_frame == outer && rt_nce_current == outer);
+    check_host();
 }
 
 static void host(Cpu *c) {
@@ -202,6 +221,12 @@ static void host(Cpu *c) {
     c->x[8] = FIXTURE_BASE + 0x2000;
     assert(rt_call(c, FIXTURE_BASE + 0x100, 0) == 0xbeef);
     assert(c->nce_frame == outer && rt_nce_current == outer && outer->reservation == 2);
+    uint64_t tp = c->tpidr, tpro = c->tpidrro;
+    c->tpidr = 0xabcdef0123456789ull;
+    c->tpidrro = 0x9876543210fedcbaull;
+    leaf_values(c); // A new callback activation must read the current fields, not an outer snapshot.
+    c->tpidr = tp;
+    c->tpidrro = tpro;
     c->x[17] = 0x1717;
     c->x[18] = 0x1818;
     c->x[30] = 0xbad0;
@@ -388,6 +413,10 @@ int main(void) {
     assert(!sigaction(SIGILL, &old_sigill, NULL));
     assert(rt_nce_original_pc(FIXTURE_BASE + 0x40));
     assert(!rt_nce_original_pc(rt_nce_modules[0].arena));
+    for (uint64_t i = 0; i < rt_nce_modules[0].site_count; i++) {
+        const NceSite *s = &rt_nce_modules[0].sites[i];
+        if (s->entry) assert(!rt_nce_original_pc(s->entry)); // Private leaves cannot be captured as original state.
+    }
     uint64_t end;
     assert(plat_mem_state(rt_nce_modules[0].arena, rt_nce_modules[0].arena + 1, &end) == PLAT_PROT_RX);
     assert(plat_mem_state(FIXTURE_BASE, FIXTURE_BASE + 1, &end) == PLAT_PROT_RX);
@@ -407,6 +436,16 @@ int main(void) {
     assert(c.v[31] == (((__uint128_t)32 << 100 | 1265) ^ 0x1234));
     assert(c.fpcr == 0x1c00000 && c.fpsr == 0x800009f && c.nzcv == 0xa0000000);
     assert(c.nce_frame == NULL && rt_nce_current == NULL && calls == 1 && svcs == 2);
+    leaf_values(&c);
+    c.x[0] = 0x1234567887654321ull;
+    assert(rt_call(&c, FIXTURE_BASE + 0xc80, 0) == 0x1234567887654321ull);
+    assert(c.tpidr == c.x[0] && c.x[1] == c.tpidrro);
+    leaf_values(&c);
+    c.x[8] = FIXTURE_BASE + 0x2000;
+    c.x[0] = 11;
+    ST64(c.x[8], 7);
+    rt_call(&c, FIXTURE_BASE + 0xd00, 0);
+    assert(c.x[10] == 0 && LD64(c.x[8]) == 11 && c.x[16] == c.tpidr && c.x[17] == c.tpidrro && c.x[18] == 4);
     for (patch_on = 0; patch_on < 2; patch_on++) assert(rt_call(&c, FIXTURE_BASE + 0x180, 0) == (patch_on ? 9 : 3));
     for (patch_on = 0; patch_on < 2; patch_on++)
         for (unsigned offset = 4; offset <= 12; offset += 4) expect_failure(&c, FIXTURE_BASE + 0x200 + offset);
