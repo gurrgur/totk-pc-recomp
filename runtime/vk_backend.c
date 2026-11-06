@@ -152,7 +152,7 @@ enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH,
        DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_N };
 static const char *const dr_name[DR_N] = {
     "pool_fini", "map_virtual", "texture_release (queued)", "program_release", "finish", "read_texels (writer fence)",
-    "write_texels", "guest_read (writer fence)", "frame bound", "queue full", "check drain"};
+    "write_texels (writer fence)", "guest_read (writer fence)", "frame bound", "queue full", "check drain"};
 
 static PlatMutex rl = PLAT_MUTEX_INIT;
 static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
@@ -481,10 +481,30 @@ static void vk_be_read_texels(const tex_t *t, const view_t *v, const NVNcopyRegi
     plat_mutex_unlock(&rl);
     free(again);
 }
+// WriteTexels with the replay queued: like ReadTexels, waits for the newest submission recorded to write the texture,
+// not for the whole queue, so the CPU write lands after it. Submissions still queued see the new texels, as on hardware
+// when the GPU has not reached them yet; the game only reuses a texture they read after a sync, and every sync value
+// covers replay and GPU. The full drain this replaced made the streaming threads wait about 10 ms per call for the
+// whole frame's replay (280 waits in 40 s of Lookout Landing at 720p on an 8-core Linux handheld), and the game's main
+// thread waited on them in its slow frames.
 static void vk_be_write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, uint64_t row,
                                uint64_t img) {
     vk_sync_start();
-    replay_drain(DR_WRITE_TEXELS);
+    if (gfx_replay_async()) {
+        uint64_t f = vk_texture_last_write(t);
+        plat_mutex_lock(&rl);
+        dr_calls[DR_WRITE_TEXELS]++, dr_tcalls[DR_WRITE_TEXELS]++;
+        plat_mutex_unlock(&rl);
+        if (f && vk_sync_fence_done() < f) {
+            uint64_t t0 = kern_now_ns();
+            vk_sync_fence_wait(f, UINT64_MAX);
+            uint64_t d = kern_now_ns() - t0;
+            plat_mutex_lock(&rl);
+            dr_waits[DR_WRITE_TEXELS]++, dr_twaits[DR_WRITE_TEXELS]++;
+            dr_ns[DR_WRITE_TEXELS] += d, dr_tns[DR_WRITE_TEXELS] += d;
+            plat_mutex_unlock(&rl);
+        }
+    }
     vk_present_drain();
     vk_write_texels(t, v, r, src, row, img);
 }
