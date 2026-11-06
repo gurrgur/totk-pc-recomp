@@ -108,7 +108,9 @@ static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
 #elif defined(__aarch64__)
-    __asm__ volatile("yield");
+    // yield is a hint the core may drop: 0.45 ns on Oryon, against 13 ns for x86 pause, so every spin loop written
+    // for pause ran 30 times shorter and the locks slept at once. isb waits for the pipeline, about 11 ns there.
+    __asm__ volatile("isb" ::: "memory");
 #endif
 }
 
