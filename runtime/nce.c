@@ -218,31 +218,52 @@ void rt_nce_publish(void) {
 
 void rt_nce_bind(Cpu *c) { rt_nce_current = c ? c->nce_frame : NULL; }
 
-void rt_nce_cleanup(Cpu *c) {
-    NceFrame *f = c->nce_frame;
-    c->nce_frame = NULL;
+static void free_frames(NceFrame *f) {
     while (f) {
         NceFrame *p = f->previous;
         munmap(f->mapping, f->mapping_size);
         free(f);
         f = p;
     }
+}
+
+void rt_nce_cleanup(Cpu *c) {
+    free_frames(c->nce_frame);
+    free_frames(c->nce_spare);
+    c->nce_frame = c->nce_spare = NULL;
     rt_nce_current = NULL;
+}
+
+// An activation and its guarded host stack. Host code calls native guest code thousands of times a second (dispatch.c
+// for callbacks and guest function pointers); a fresh mapping per call cost an mmap, a page fault on the new stack and
+// an munmap whose TLB shootdown interrupts every core running the process. Finished activations stay on the Cpu's
+// spare list, as deep as its calls nested, until the thread ends (rt_nce_cleanup).
+static NceFrame *frame_take(Cpu *c) {
+    NceFrame *f = c->nce_spare;
+    if (f) {
+        c->nce_spare = f->previous;
+        void *p = f->mapping;
+        size_t size = f->mapping_size;
+        memset(f, 0, sizeof *f);
+        f->mapping = p, f->mapping_size = size;
+        return f;
+    }
+    size_t guard = (size_t)sysconf(_SC_PAGESIZE), size = NCE_STACK + 2 * guard;
+    void *p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    f = calloc(1, sizeof *f);
+    if (p == MAP_FAILED || !f || mprotect((char *)p + guard, NCE_STACK, PROT_READ | PROT_WRITE))
+        rt_fatal("nce: cannot allocate guarded host stack");
+    f->mapping = p, f->mapping_size = size;
+    return f;
 }
 
 void rt_nce_call(Cpu *c) {
     if (!rt_nce_original_pc(c->pc)) rt_fatal("nce: native function entry before load or outside executable text");
     if (c->sp & 15) rt_fatal("nce: unaligned guest SP");
-    size_t guard = (size_t)sysconf(_SC_PAGESIZE), size = NCE_STACK + 2 * guard;
-    void *p = mmap(NULL, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    NceFrame *f = calloc(1, sizeof *f);
-    if (p == MAP_FAILED || !f || mprotect((char *)p + guard, NCE_STACK, PROT_READ | PROT_WRITE))
-        rt_fatal("nce: cannot allocate guarded host stack");
+    NceFrame *f = frame_take(c);
     f->cpu = c;
     f->previous = c->nce_frame;
-    f->mapping = p;
-    f->mapping_size = size;
-    f->service_sp = (uint64_t)(uintptr_t)p + guard + NCE_STACK;
+    f->service_sp = (uint64_t)(uintptr_t)f->mapping + f->mapping_size - (size_t)sysconf(_SC_PAGESIZE);
     f->target = c->pc;
     f->reservation = 2;
     f->last_operation = UINT32_MAX;
@@ -254,8 +275,8 @@ void rt_nce_call(Cpu *c) {
     if (c->nce_frame != f) rt_fatal("nce: corrupted activation ownership");
     c->nce_frame = f->previous;
     rt_nce_bind(c);
-    munmap(p, size);
-    free(f);
+    f->previous = c->nce_spare;
+    c->nce_spare = f;
 }
 
 static const NceSite *site_at(uint64_t pc) {

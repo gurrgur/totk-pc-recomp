@@ -24,7 +24,8 @@ typedef struct __attribute__((aligned(16))) Cpu {
     uint64_t excl_val_hi;    // 336: upper half of a 128-bit exclusive pair (LDXP/LDAXP of two X registers)
 #if RT_NCE
     struct NceFrame *nce_frame; // Private activations follow their fiber, not its current host thread.
-    uint8_t _pad[512 - 352];
+    struct NceFrame *nce_spare; // 352: finished activations kept with their stacks for the next call (nce.c)
+    uint8_t _pad[512 - 360];
 #else
     uint8_t _pad[512 - 344];
 #endif
