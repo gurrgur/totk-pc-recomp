@@ -1771,7 +1771,9 @@ int kern_svc(Cpu *c, uint32_t imm) {
             unlock();
             return 1;
         }
-        // Yield: hand the core to a waiting thread of equal or better priority.
+        // Yield: hand the core to a waiting thread of equal or better priority. With none, Horizon returns at once and
+        // so does this: a host yield here kept the core while the host scheduler parked the thread, up to a whole
+        // time slice (3-4 ms on an 8-core Linux handheld), and a better thread that came for the core waited that long.
         lock();
         int give = 0;
         int tp = prio_of(t);
@@ -1782,7 +1784,6 @@ int kern_svc(Cpu *c, uint32_t imm) {
             core_take(t);
         }
         unlock();
-        if (!give) plat_yield();
         return 1;
     }
     case 0x0C: {   // GetThreadPriority(w1 handle -> w1)
