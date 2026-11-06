@@ -588,12 +588,16 @@ class LeafChecks(unittest.TestCase):
 
     def test_nonleaf_operations_keep_full_boundaries(self):
         code = assemble('msr tpidr_el0, x0\nmrs x1, cntvct_el0\nmrs x2, cntpct_el0\n'
-                        'svc #1\ndc civac, x0\ndc zva, x0\nmov w3, #3')
+                        'svc #1\nic ivau, x0\ndc zva, x0\nmov w3, #3')
         table = patches.Table([('test', 'TEST', 0)], {'main': {24: [(0, [n.NOP], code[-1])]}})
         sites, _ = plan(code, table)
         self.assertEqual([s['operation'] for s in sites],
                          [n.WRITE_TP, n.TICKS, n.TICKS, n.SVC, n.CACHE, n.ZERO, n.PATCH])
         self.assertTrue(all(s['entry'] and s['resume'] for s in sites))
+
+    def test_data_cache_clean_runs_as_nop(self):
+        sites, _ = plan(assemble('dc civac, x0'), patches.Table())
+        self.assertEqual([(s['operation'], s['argument']) for s in sites], [(n.WORD, n.NOP)])
 
 
 class PreparationChecks(unittest.TestCase):

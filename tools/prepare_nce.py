@@ -69,7 +69,12 @@ def operation(w):
             return WORD, 0xd503203f
         if w in (0xd50320ff, 0xd503219f, 0xd50321df):  # A57 has no pointer authentication.
             return WORD, NOP
-        if w & 0xffffffe0 in (0xd50b7e20, 0xd50b7520):
+        if w & 0xffffffe0 == 0xd50b7e20:
+            # DC CIVAC: the game cleans lines for the Switch GPU, which reads guest memory directly. Here the GPU
+            # reads the runtime's copies of coherent memory, so the instruction has nothing to do, as in the C
+            # lifter. A boundary per line cost about 120k crossings per second while traversing.
+            return WORD, NOP
+        if w & 0xffffffe0 == 0xd50b7520:  # IC IVAU
             return CACHE, 0
         if w & 0xffffffe0 == 0xd50b7420:
             return ZERO, 0
