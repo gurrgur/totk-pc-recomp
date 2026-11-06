@@ -211,5 +211,145 @@ rt_nce_boundary:
 .endm
 host_probe rt_nce_host_probe64, 1
 host_probe rt_nce_host_probe32, 0
+
+// ---- direct host functions (nce.c rt_nce_publish, NCE_DIRECT): host functions simple enough to run here, on the
+// guest's stack and registers, without the boundary. The gate enters with x17 = its own address; a case a stub does
+// not handle goes through the boundary as the plain gate would (sub, stp, then rt_nce_boundary with x17 = the gate).
+// Stubs follow the host-function contract (host.h): they clobber only x0-x17 and v0-v7/v16-v31, never x18, and run
+// no floating point, so the guest's FPCR needs no switch. The struct offsets are checked in nce.c.
+.macro direct name
+.p2align 4
+.global \name
+.type \name,%function
+\name:
+.endm
+.macro direct_end name
+.size \name, .-\name
+.endm
+.macro boundary
+    sub sp, sp, #32
+    stp x16, x17, [sp]
+    b rt_nce_boundary
+.endm
+
+// memcpy (nvn_api_core.c ov_memcpy): copies below 1 KiB need no GPU check and go to the host memmove.
+direct rt_direct_memcpy
+    cmp x2, #1024
+    b.hs 1f
+    adrp x16, rt_direct_memmove
+    ldr x16, [x16, :lo12:rt_direct_memmove]
+    br x16
+1:  boundary
+direct_end rt_direct_memcpy
+
+// nvnBufferGetAddress: pool->mem + off, 0 without a pool or storage (nvn_api_core.c buf_address).
+direct rt_direct_buffer_get_address
+    ldr x1, [x0, #8]
+    cbz x1, 1f
+    ldr x2, [x1, #8]
+    cbz x2, 1f
+    ldr x3, [x0, #16]
+    add x0, x2, x3
+    ret
+1:  mov x0, #0
+    ret
+direct_end rt_direct_buffer_get_address
+
+// nvnDeviceGetTextureHandle: texture id | sampler id << 20; ids out of range go to the C version, which stops.
+direct rt_direct_device_get_texture_handle
+    mov w3, #0x100000
+    cmp w1, w3
+    b.hs 1f
+    cmp w2, #0x1000
+    b.hs 1f
+    mov w0, w1
+    ubfiz x3, x2, #20, #12
+    orr x0, x0, x3
+    ret
+1:  boundary
+direct_end rt_direct_device_get_texture_handle
+
+// nvnMemoryPoolGetFlags: pool->flags.
+direct rt_direct_memory_pool_get_flags
+    ldr w0, [x0, #4]
+    ret
+direct_end rt_direct_memory_pool_get_flags
+
+// nvnChannelMaskStateSetChannelMask(state, target, r, g, b, a): 4 bits per target, NVNboolean is the low byte.
+direct rt_direct_channel_mask_set
+    cmp w1, #7
+    b.hi 1f
+    tst w2, #0xff
+    cset w6, ne
+    tst w3, #0xff
+    cset w7, ne
+    orr w6, w6, w7, lsl #1
+    tst w4, #0xff
+    cset w7, ne
+    orr w6, w6, w7, lsl #2
+    tst w5, #0xff
+    cset w7, ne
+    orr w6, w6, w7, lsl #3
+    lsl w1, w1, #2
+    mov w7, #0xf
+    lsl w7, w7, w1
+    lsl w6, w6, w1
+    ldr w8, [x0]
+    bic w8, w8, w7
+    orr w8, w8, w6
+    str w8, [x0]
+1:  ret
+direct_end rt_direct_channel_mask_set
+
+// NVNbufferBuilder {dev, pool, off, size}: SetDevice, SetDefaults (keeps the device), SetStorage.
+direct rt_direct_buffer_builder_set_device
+    str x1, [x0]
+    ret
+direct_end rt_direct_buffer_builder_set_device
+direct rt_direct_buffer_builder_set_defaults
+    stp xzr, xzr, [x0, #8]
+    str xzr, [x0, #24]
+    ret
+direct_end rt_direct_buffer_builder_set_defaults
+direct rt_direct_buffer_builder_set_storage
+    stp x1, x2, [x0, #8]
+    str x3, [x0, #24]
+    ret
+direct_end rt_direct_buffer_builder_set_storage
+
+// nvnBufferInitialize(buffer, builder): the checks of nvn_api_core.c nvnBufferInitialize, then {BUF, pool, off, size}.
+direct rt_direct_buffer_initialize
+    ldr x2, [x1, #8]
+    cbz x2, 1f
+    ldr w3, [x2]
+    mov w4, #0x4f50
+    movk w4, #0x4c4f, lsl #16
+    cmp w3, w4
+    b.ne 1f
+    ldr x3, [x1, #16]
+    tbnz x3, #63, 1f
+    ldr x4, [x2, #16]
+    cmp x3, x4
+    b.hi 1f
+    ldr x5, [x1, #24]
+    sub x4, x4, x3
+    cmp x5, x4
+    b.hi 1f
+    mov w6, #0x5542
+    movk w6, #0x46, lsl #16
+    stp x6, x2, [x0]
+    stp x3, x5, [x0, #16]
+    mov w0, #1
+    ret
+1:  mov w0, #0
+    ret
+direct_end rt_direct_buffer_initialize
+
+// nvnBufferFinalize: the 32-byte buffer object zeroed.
+direct rt_direct_buffer_finalize
+    stp xzr, xzr, [x0]
+    stp xzr, xzr, [x0, #16]
+    ret
+direct_end rt_direct_buffer_finalize
 .section .note.GNU-stack,"",%progbits
 #endif

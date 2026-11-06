@@ -114,6 +114,7 @@ GuestFn hostfn_observer(const char *name);                 // NULL if none
 void hostfn_add_override(const char *name, GuestFn fn);    // an override outside the linker table (probes); before
                                                            // ldr_load
 const char *hostfn_name(uint64_t addr);                    // name registered at a synthetic address, NULL if none
+GuestFn hostfn_fn(uint64_t addr);                           // the function registered at a synthetic address, NULL if none
 void hostfn_seal(void);                                    // build the dispatch table (rt_dispatch_init over every
                                                            // linked module); idempotent; registration ends here
 uint64_t hostfn_calls(void);                               // host-function calls so far, all threads

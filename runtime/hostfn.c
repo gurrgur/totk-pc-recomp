@@ -130,6 +130,12 @@ const char *hostfn_name(uint64_t addr) {
     return slots[i].name;
 }
 
+GuestFn hostfn_fn(uint64_t addr) {
+    uint64_t i = (addr - RT_HOSTFN_BASE) >> 4;
+    if ((addr & 15) || i >= (uint64_t)nslots) return NULL;
+    return slots[i].fn;
+}
+
 __attribute__((noinline, noreturn, cold)) static void bad_entry(Cpu *c) {
     char lr[96];
     rt_fatal("host function call at %#llx: no host function registered there (lr %s)", (unsigned long long)c->pc,

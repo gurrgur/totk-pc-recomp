@@ -5,6 +5,8 @@
 #if RT_NCE
 #include "host.h"
 #include "platform/platform.h"
+#include "cfg.h"
+#include "nvn_api.h"
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -196,6 +198,103 @@ int rt_nce_check_text(const char *name, uint64_t address, const void *original, 
     return !memcmp(source + cursor, (const void *)(uintptr_t)(address + cursor), size - cursor);
 }
 
+// ---- direct host functions
+// About three million host calls a second went through the boundary on Lookout Landing (AYN Odin 3), each saving and
+// restoring every register and switching FPCR twice, and four in ten were memcpy and NVN calls that only read or
+// write the object they are given. Those run as stubs (nce_aarch64.S, "direct host functions") that the gate jumps to:
+// adr x17 to the gate itself, the stub's address loaded from the gate's last word, br. The executable is linked
+// without PIE, so the stubs lie below 4 GiB. A preempt request that finds a thread in a stub retries, as in any host
+// code (kernel.c ap_try). Each stub is checked against its C version at publication; a mismatch, or TOTK_NCE_DIRECT=0,
+// keeps every gate on the boundary.
+void *(*rt_direct_memmove)(void *, const void *, size_t) = memmove;
+void ov_memcpy(Cpu *c);
+#define DIRECT(stub, name, fn) void stub(void); void fn(Cpu *c);
+#define DIRECT_LIST(X)                                                                                              \
+    X(rt_direct_memcpy, "memcpy", ov_memcpy)                                                                         \
+    X(rt_direct_buffer_get_address, "nvn:nvnBufferGetAddress", nvnp_nvnBufferGetAddress)                             \
+    X(rt_direct_device_get_texture_handle, "nvn:nvnDeviceGetTextureHandle", nvnp_nvnDeviceGetTextureHandle)          \
+    X(rt_direct_memory_pool_get_flags, "nvn:nvnMemoryPoolGetFlags", nvnp_nvnMemoryPoolGetFlags)                      \
+    X(rt_direct_channel_mask_set, "nvn:nvnChannelMaskStateSetChannelMask", nvnp_nvnChannelMaskStateSetChannelMask)   \
+    X(rt_direct_buffer_builder_set_device, "nvn:nvnBufferBuilderSetDevice", nvnp_nvnBufferBuilderSetDevice)          \
+    X(rt_direct_buffer_builder_set_defaults, "nvn:nvnBufferBuilderSetDefaults", nvnp_nvnBufferBuilderSetDefaults)    \
+    X(rt_direct_buffer_builder_set_storage, "nvn:nvnBufferBuilderSetStorage", nvnp_nvnBufferBuilderSetStorage)       \
+    X(rt_direct_buffer_initialize, "nvn:nvnBufferInitialize", nvnp_nvnBufferInitialize)                              \
+    X(rt_direct_buffer_finalize, "nvn:nvnBufferFinalize", nvnp_nvnBufferFinalize)
+DIRECT_LIST(DIRECT)
+#undef DIRECT
+#define DIRECT(stub, name, fn) {stub, name, fn},
+static const struct { void (*stub)(void); const char *name; GuestFn fn; } directs[] = {DIRECT_LIST(DIRECT)};
+#undef DIRECT
+_Static_assert(offsetof(buf_t, pool) == 8 && offsetof(buf_t, off) == 16 && offsetof(buf_t, size) == 24 &&
+               sizeof(buf_t) == 32, "nce_aarch64.S buffer stubs");
+_Static_assert(offsetof(buf_builder_t, pool) == 8 && offsetof(buf_builder_t, off) == 16 &&
+               offsetof(buf_builder_t, size) == 24, "nce_aarch64.S buffer builder stubs");
+_Static_assert(offsetof(pool_t, flags) == 4 && offsetof(pool_t, mem) == 8 && offsetof(pool_t, size) == 16 &&
+               NVN_POOL_MAGIC == 0x4c4f4f50, "nce_aarch64.S pool stubs");
+
+typedef uint64_t (*DirectCall)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+// Runs the stub and the C version on copies of obj (the first argument) and compares the object and the result.
+static int direct_same(int k, const void *obj, size_t n, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                       uint64_t a5, int result) {
+    uint8_t x[64], y[64];
+    memcpy(x, obj, n), memcpy(y, obj, n);
+    Cpu *c = calloc(1, sizeof *c);
+    if (!c) rt_fatal("nce: out of memory");
+    uint64_t a[6] = {(uintptr_t)x, a1, a2, a3, a4, a5};
+    memcpy(c->x, a, sizeof a);
+    directs[k].fn(c);
+    uint64_t want = c->x[0];
+    free(c);
+    uint64_t got = ((DirectCall)(uintptr_t)directs[k].stub)((uintptr_t)y, a1, a2, a3, a4, a5);
+    if (memcmp(x, y, n) || (result && got != want)) {
+        rt_log("nce: direct %s differs from its C version (result %#llx, expected %#llx): every host call keeps the "
+               "boundary", directs[k].name, (unsigned long long)got, (unsigned long long)want);
+        return 0;
+    }
+    return 1;
+}
+
+static int direct_check(void) {
+    static uint8_t storage[256];
+    pool_t pool = {NVN_POOL_MAGIC, 0x1234, storage, sizeof storage}, bare = pool, other = pool;
+    bare.mem = NULL;
+    other.magic = 0;
+    buf_t b = {1, &pool, 0x20, 0x40}, nb = {1, &bare, 0x20, 0x40}, np = {1, NULL, 0, 0};
+    buf_builder_t ok = {(NVNdevice *)&pool, &pool, 0x40, 0x80}, far = ok, big = ok, neg = ok, wrong = ok, none = ok;
+    far.off = 0x101, big.size = 0xc1, neg.off = -16, wrong.pool = &other, none.pool = NULL;
+    chmask_st m = {0xffffffffu};
+    int k = 0, r = 1;
+    r &= direct_same(k++, storage, 64, (uintptr_t)(storage + 128), 40, 0, 0, 0, 0);   // memcpy: returns its copy
+    r &= direct_same(k, &b, sizeof b, 0, 0, 0, 0, 0, 1) && direct_same(k, &nb, sizeof nb, 0, 0, 0, 0, 0, 1) &&
+         direct_same(k, &np, sizeof np, 0, 0, 0, 0, 0, 1), k++;
+    r &= direct_same(k, &pool, 8, 5, 7, 0, 0, 0, 1) && direct_same(k, &pool, 8, 0xfffff, 0xfff, 0, 0, 0, 1), k++;
+    r &= direct_same(k++, &pool, sizeof pool, 0, 0, 0, 0, 0, 1);
+    r &= direct_same(k, &m, sizeof m, 3, 1, 0, 0x100, 0x101, 0) && direct_same(k, &m, sizeof m, 7, 0, 2, 0, 1, 0) &&
+         direct_same(k, &m, sizeof m, 9, 1, 1, 1, 1, 0) && direct_same(k, &m, sizeof m, (uint32_t)-1, 0, 0, 0, 0, 0), k++;
+    r &= direct_same(k++, &ok, sizeof ok, (uintptr_t)&m, 0, 0, 0, 0, 0);
+    r &= direct_same(k++, &ok, sizeof ok, 0, 0, 0, 0, 0, 0);
+    r &= direct_same(k++, &ok, sizeof ok, (uintptr_t)&pool, 0x10, 0x20, 0, 0, 0);
+    const buf_builder_t *bs[] = {&ok, &far, &big, &neg, &wrong, &none};
+    for (int i = 0; i < 6; i++) r &= direct_same(k, &b, sizeof b, (uintptr_t)bs[i], 0, 0, 0, 0, 1);
+    k++;
+    r &= direct_same(k++, &b, sizeof b, 0, 0, 0, 0, 0, 0);
+    return r;
+}
+
+// The stub for the host function at a, if it may run directly.
+static uint64_t direct_for(uint64_t a) {
+    static int on = -1;
+    if (on < 0) on = !(cfg_get("TOTK_NCE_DIRECT") && !cfg_bool("TOTK_NCE_DIRECT")) && direct_check();
+    const char *name = on ? hostfn_name(a) : NULL;
+    for (unsigned i = 0; name && i < sizeof directs / sizeof *directs; i++)
+        if (!strcmp(name, directs[i].name) && hostfn_fn(a) == directs[i].fn) {
+            uint64_t s = (uint64_t)(uintptr_t)directs[i].stub;
+            if (s >> 32) rt_fatal("nce: direct host function %s above 4 GiB", name);
+            return s;
+        }
+    return 0;
+}
+
 void rt_nce_publish(void) {
     if (__atomic_load_n(&published, __ATOMIC_ACQUIRE) || loaded != rt_nce_module_count) return;
     if (!plat_mem_commit(RT_HOSTFN_BASE, RT_HOSTFN_SIZE)) rt_fatal("nce: cannot commit native host gates");
@@ -203,8 +302,17 @@ void rt_nce_publish(void) {
     ST32(HOST_BRIDGE, 0x58000050); // ldr x16, literal at +8
     ST32(HOST_BRIDGE + 4, 0xd61f0200); // br x16
     ST64(HOST_BRIDGE + 8, (uint64_t)(uintptr_t)rt_nce_boundary);
+    unsigned ndirect = 0;
     for (unsigned i = 0; i < host_count; i++) {
-        uint64_t a = host_addresses[i];
+        uint64_t a = host_addresses[i], d = direct_for(a);
+        if (d) {
+            ST32(a, 0x10000011); // adr x17, .
+            ST32(a + 4, 0xb9400e30); // ldr w16, [x17, #12]
+            ST32(a + 8, 0xd61f0200); // br x16
+            ST32(a + 12, (uint32_t)d);
+            ndirect++;
+            continue;
+        }
         ST32(a, 0xd10083ff); // sub sp, sp, #32
         ST32(a + 4, 0xa90047f0); // stp x16, x17, [sp]
         ST32(a + 8, 0x10ffffd1); // adr x17, .-8
@@ -213,6 +321,7 @@ void rt_nce_publish(void) {
     plat_icache_flush((void *)(uintptr_t)RT_HOSTFN_BASE, RT_HOSTFN_SIZE);
     if (!plat_mem_protect(RT_HOSTFN_BASE, RT_HOSTFN_SIZE, PLAT_PROT_RX)) rt_fatal("nce: cannot seal native host gates");
     qualify_host();
+    if (ndirect) rt_log("nce: %u host functions run without the boundary (TOTK_NCE_DIRECT=0 turns that off)", ndirect);
     __atomic_store_n(&published, 1, __ATOMIC_RELEASE);
 }
 

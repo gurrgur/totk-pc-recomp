@@ -56,7 +56,7 @@ void nvn_guest_written(uint64_t addr, uint64_t size) {
 // memcpy of pool storage the GPU rendered into must copy what the GPU wrote: TotK moves its generated grass maps
 // between pools with memcpy. Copies below 1 KiB skip the check; the copy itself is memmove, as overlapping
 // arguments are undefined for memcpy anyway.
-static void ov_memcpy(Cpu *c) {
+void ov_memcpy(Cpu *c) {   // nce.c checks nce_aarch64.S rt_direct_memcpy, its native form below 1 KiB, against it
     uint64_t dst = arg_x(c, 0), src = arg_x(c, 1), n = arg_x(c, 2);
     if (n >= 1024) gfx_backend()->guest_read(src, n);
     memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);

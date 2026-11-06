@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <sys/ucontext.h>
@@ -234,6 +235,17 @@ static void host(Cpu *c) {
 }
 
 static void sentinel(Cpu *c) { (void)c; rt_fatal("fixture sentinel dispatched as host C"); }
+// runtime/nce.c pairs its direct-call stubs with these C versions and reads TOTK_NCE_DIRECT; the fixture turns direct
+// calls off, so none of the C versions runs.
+const char *cfg_get(const char *name) { return strcmp(name, "TOTK_NCE_DIRECT") ? NULL : "0"; }
+int cfg_bool(const char *name) { (void)name; return 0; }
+GuestFn hostfn_fn(uint64_t addr) { (void)addr; return NULL; }
+void rt_log(const char *fmt, ...) { (void)fmt; }
+#define NOT_CALLED(name) void name(Cpu *c) { (void)c; rt_fatal(#name " called with direct calls off"); }
+NOT_CALLED(ov_memcpy) NOT_CALLED(nvnp_nvnBufferGetAddress) NOT_CALLED(nvnp_nvnDeviceGetTextureHandle)
+NOT_CALLED(nvnp_nvnMemoryPoolGetFlags) NOT_CALLED(nvnp_nvnChannelMaskStateSetChannelMask)
+NOT_CALLED(nvnp_nvnBufferBuilderSetDevice) NOT_CALLED(nvnp_nvnBufferBuilderSetDefaults)
+NOT_CALLED(nvnp_nvnBufferBuilderSetStorage) NOT_CALLED(nvnp_nvnBufferInitialize) NOT_CALLED(nvnp_nvnBufferFinalize)
 const char *hostfn_name(uint64_t pc) { return pc == RT_HOSTFN_BASE + 0x40 ? "fixture host" : NULL; }
 GuestFn rt_dispatch_lookup(uint64_t pc) {
     if (pc == RT_HOSTFN_BASE + 0x40) return host;

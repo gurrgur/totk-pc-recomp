@@ -20,7 +20,9 @@ def linked_bridge():
         p = Path(tmp)
         (p / 'support.S').write_text('.text\n.global rt_nce_service\nrt_nce_service: ret\n'
                                     '.section .tbss,"awT",%nobits\n.global rt_nce_current\n'
-                                    '.p2align 3\nrt_nce_current: .skip 8\n')
+                                    '.p2align 3\nrt_nce_current: .skip 8\n'
+                                    # the small-copy target of rt_direct_memcpy (runtime/nce.c)
+                                    '.data\n.global rt_direct_memmove\n.p2align 3\nrt_direct_memmove: .quad 0\n')
         for source, target in ((ROOT / 'runtime/nce_aarch64.S', p / 'bridge.o'), (p / 'support.S', p / 'support.o')):
             subprocess.run(['clang', '--target=aarch64-linux-gnu', '-DRT_NCE=1', '-c', str(source), '-o', str(target)], check=True)
         subprocess.run(['ld.lld', '--image-base=0x0', '-Ttext=0x100000', '--entry=rt_nce_run', str(p / 'bridge.o'), str(p / 'support.o'), '-o', str(p / 'bridge')], check=True)
