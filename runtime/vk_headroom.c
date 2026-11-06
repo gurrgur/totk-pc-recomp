@@ -1,7 +1,7 @@
 // VRAM headroom: the next VMA block of a memory type is allocated on a background thread, not on the render thread.
 //
-// VMA places an allocation in an existing block of its memory type and allocates a new block (vkAllocateMemory, 32 to
-// 256 MiB) only when none has room. On the render thread that took 8-19 ms per block, several times in the first
+// VMA places an allocation in an existing block of its memory type and allocates a new block (vkAllocateMemory, 32 MiB:
+// vk_vma_block_size) only when none has room. On the render thread that took 8-19 ms per block, several times in the first
 // minute of play while VRAM grows (textures from create_tex, mirrors). A new VkDeviceMemory made by any other thread
 // (VMA's pfnAllocate callback) wakes this thread for its memory type, which it then checks every 500 ms. A check
 // allocates half a default block of that type (the largest size VMA still places in blocks, not in dedicated memory).
@@ -53,9 +53,15 @@ const VmaDeviceMemoryCallbacks *vk_headroom_callbacks(void) {
     return H.on ? &cb : NULL;
 }
 
+// VMA's block size on large heaps (preferredLargeHeapBlockSize; VMA's default is 256 MiB). Allocating a block costs
+// time in the kernel driver in proportion to its size, and on an integrated GPU the whole game waits for it: on an
+// Adreno 830 with Turnip (AYN Odin 3) a 256 MiB block took about 75 ms of system time while every other thread stalled,
+// a 100 ms frame each time the game's streaming grew past a block, and 32 MiB blocks keep each stall under one frame.
+VkDeviceSize vk_vma_block_size(void) { return 32ull << 20; }
+
 static VkDeviceSize block_size(const VkCtx *c, uint32_t type) {
     VkDeviceSize heap = c->mem_props.memoryHeaps[c->mem_props.memoryTypes[type].heapIndex].size;
-    return heap <= HR_SMALL_HEAP ? heap / 8 : 256ull << 20;   // VMA's default preferredLargeHeapBlockSize
+    return heap <= HR_SMALL_HEAP ? heap / 8 : vk_vma_block_size();
 }
 
 static int room(const VkCtx *c, uint32_t type, VkDeviceSize block) {
