@@ -1105,11 +1105,13 @@ void vk_temporal_shutdown(void) {
 // is always drawn, whatever fxaa says (skipping it would leave the 3D picture out), unless DLSS already wrote that
 // target this frame.
 // The stock translator's hash, the one with tools/xlate patch 0010 (PCSS, PR #89) applied, the one with patches 0010
-// and 0011 (the shadow filter spread) applied, and that one with the zero_locals job flag (Mesa, vk_caps.c).
+// and 0011 (the shadow filter spread) applied, that one with the zero_locals job flag (Mesa, vk_caps.c), and the one
+// the Linux ARM64 build gets on Turnip (Adreno 830). Without the match the scaling draw runs over the upscaled picture
+// and samples it as the smaller light target, which shows the picture's top-left part enlarged.
 // A scaling draw this list misses still scales the resolved picture, not the jittered scene: after resolution,
 // passes larger than the light target sample the backend's output (vk_temporal_swap_img).
 static const uint64_t FXAA_FS[] = {0xf450003ebeb3dc52ull, 0x0a12f4bc2a9a4fbeull, 0x5c43ae18948d52cbull,
-                                   0xaad42238801d31d8ull};
+                                   0xaad42238801d31d8ull, 0x52f489e9ad973566ull};
 
 static uint64_t spirv_hash(const GfxShader *s) {
     static struct { const GfxShader *s; uint64_t h; } tab[8192];
