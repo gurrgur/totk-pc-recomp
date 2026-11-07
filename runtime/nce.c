@@ -480,10 +480,24 @@ NceResume rt_nce_service(NceFrame *f, uint64_t pc, uint64_t original_sp, uint64_
                 break;
             }
         break;
-    case NCE_CALL:
+    case NCE_CALL: {
+        // A host function a patched BL reaches runs here with x30 = the return address and pc = its own address, as
+        // the lifted BL calls it: mouse_direct.c camera_load tells its sites apart by x30, and rt_call would hand it
+        // RT_RET_HOST. Guest code still goes through rt_call, whose RT_RET_HOST brings it back to this activation.
+        GuestFn target = rt_dispatch_lookup(s->argument);
         c->x[30] = s->link;
-        rt_call(c, s->argument, 0);
+        if (target && target != rt_nce_call) {
+            uint64_t saved_pc = c->pc;
+            if (c->thread && kern_preempt_pending(c->thread)) kern_checkpoint();
+            c->pc = s->argument;
+            target(c);
+            c->x[30] = s->link;
+            c->pc = saved_pc;
+        } else {
+            rt_call(c, s->argument, 0);
+        }
         break;
+    }
     case NCE_BRK: rt_brk(c, (uint32_t)s->argument, pc);
     case NCE_UDF: rt_udf(c, pc);
     default: rt_fatal("nce: unsupported instruction boundary");
