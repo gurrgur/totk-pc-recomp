@@ -71,6 +71,7 @@ static void rec_main(void *arg) {
     (void)arg;
     plat_thread_priority(rec_prio);
     plat_thread_boost();
+    vk_render_thread_place("recorder");
     uint64_t t = 0;
     for (;;) {
         uint64_t h = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);

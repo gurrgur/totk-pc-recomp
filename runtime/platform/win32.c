@@ -297,6 +297,7 @@ int plat_thread_priority_get(void) { return GetThreadPriority(GetCurrentThread()
 // Windows raises the clock of a core as soon as it runs; there is no per-thread floor to set.
 void plat_thread_boost_level(int pct) { (void)pct; }
 void plat_thread_boost(void) {}
+int plat_thread_fast_cluster(const char *spec, char *cpus, size_t n) { (void)spec, (void)cpus, (void)n; return 0; }
 
 void plat_yield(void) { SwitchToThread(); }
 

@@ -169,6 +169,106 @@ void plat_thread_boost(void) {
     if (boost_floor) uclamp_min((uint32_t)boost_floor);
 }
 
+// CPU lists as sysfs and taskset write them ("0-5,7").
+static int cpus_parse(const char *s, cpu_set_t *set) {
+    CPU_ZERO(set);
+    while (*s && *s != '\n') {
+        char *e;
+        long a = strtol(s, &e, 10), b = a;
+        if (e == s || a < 0 || a >= CPU_SETSIZE) return 0;
+        if (*e == '-') {
+            s = e + 1;
+            b = strtol(s, &e, 10);
+            if (e == s || b < a || b >= CPU_SETSIZE) return 0;
+        }
+        for (long i = a; i <= b; i++) CPU_SET((int)i, set);
+        s = *e == ',' ? e + 1 : e;
+    }
+    return CPU_COUNT(set) > 0;
+}
+
+static void cpus_format(const cpu_set_t *set, char *out, size_t n) {
+    size_t o = 0;
+    out[0] = 0;
+    for (int i = 0; i < CPU_SETSIZE && o < n; i++) {
+        if (!CPU_ISSET(i, set) || (i && CPU_ISSET(i - 1, set))) continue;
+        int j = i;
+        while (j + 1 < CPU_SETSIZE && CPU_ISSET(j + 1, set)) j++;
+        o += (size_t)snprintf(out + o, n - o, j > i ? "%s%d-%d" : "%s%d", o ? "," : "", i, j);
+    }
+}
+
+static long sysfs_read(const char *path, char *buf, size_t n) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    ssize_t k = read(fd, buf, n - 1);
+    close(fd);
+    if (k < 0) return -1;
+    buf[k] = 0;
+    return k;
+}
+
+// The CPUs sharing cpu's last-level cache (the cache index with the highest level).
+static int llc_cpus(int cpu, cpu_set_t *set) {
+    char path[128], buf[256];
+    int best = -1, level = -1;
+    for (int i = 0; i < 8; i++) {
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cache/index%d/level", cpu, i);
+        if (sysfs_read(path, buf, sizeof buf) < 0) break;
+        if (atoi(buf) >= level) level = atoi(buf), best = i;
+    }
+    if (best < 0) return 0;
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cache/index%d/shared_cpu_list", cpu, best);
+    return sysfs_read(path, buf, sizeof buf) > 0 && cpus_parse(buf, set);
+}
+
+// The fastest cluster: the CPUs of the highest capacity, when exactly they share one last-level cache, they number two
+// or more and four or more other CPUs remain (the guest's three cores and the rest of the host threads).
+static int fast_cluster(cpu_set_t *fast) {
+    cpu_set_t all, llc;
+    char path[96], buf[64];
+    if (sched_getaffinity(0, sizeof all, &all)) return 0;
+    long cap[CPU_SETSIZE], top = -1;
+    for (int i = 0; i < CPU_SETSIZE; i++) {
+        cap[i] = -1;
+        if (!CPU_ISSET(i, &all)) continue;
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", i);
+        if (sysfs_read(path, buf, sizeof buf) < 0) return 0;   // no capacities: CPUs alike, or no such interface
+        cap[i] = atol(buf);
+        if (cap[i] > top) top = cap[i];
+    }
+    CPU_ZERO(fast);
+    for (int i = 0; i < CPU_SETSIZE; i++)
+        if (cap[i] == top) CPU_SET(i, fast);
+    int first = -1;
+    for (int i = 0; i < CPU_SETSIZE && first < 0; i++)
+        if (CPU_ISSET(i, fast)) first = i;
+    if (first < 0 || !llc_cpus(first, &llc)) return 0;
+    CPU_AND(&llc, &llc, &all);
+    return CPU_EQUAL(&llc, fast) && CPU_COUNT(fast) >= 2 && CPU_COUNT(&all) - CPU_COUNT(fast) >= 4;
+}
+
+int plat_thread_fast_cluster(const char *spec, char *cpus, size_t n) {
+    static PlatMutex lock = PLAT_MUTEX_INIT;
+    static cpu_set_t found;
+    static int state;   // 0 not looked yet, 1 found, 2 none
+    cpu_set_t s;
+    if (spec && !strcmp(spec, "0")) return 0;
+    if (spec && *spec && strcmp(spec, "1")) {
+        if (!cpus_parse(spec, &s)) return 0;
+    } else {
+        plat_mutex_lock(&lock);
+        if (!state) state = fast_cluster(&found) ? 1 : 2;
+        s = found;
+        int ok = state == 1;
+        plat_mutex_unlock(&lock);
+        if (!ok) return 0;
+    }
+    if (sched_setaffinity(0, sizeof s, &s)) return 0;
+    cpus_format(&s, cpus, n);
+    return 1;
+}
+
 static void *thread_main(void *p) {
     PlatThread *t = p;
     alt_stack();

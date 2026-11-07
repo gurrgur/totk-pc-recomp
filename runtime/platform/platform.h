@@ -103,6 +103,11 @@ int plat_thread_priority_get(void);       // the calling thread's level
 // below the clock limits the system sets). Threads start without it. 0, and Windows, do nothing.
 void plat_thread_boost_level(int pct);
 void plat_thread_boost(void);
+// Places the calling thread on the CPUs of the fastest cluster, for the two threads that feed the GPU. spec "0" does
+// nothing, a CPU list ("6-7") names the CPUs, anything else (unset) takes the CPUs of the highest capacity when they
+// share a last-level cache of their own, number two or more and leave four or more others. Returns 1 when placed and
+// writes the CPU list to cpus. Windows does nothing.
+int plat_thread_fast_cluster(const char *spec, char *cpus, size_t n);
 void plat_yield(void);                    // gives the rest of the time slice to another ready thread
 static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)

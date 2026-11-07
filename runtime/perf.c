@@ -239,8 +239,10 @@ int rt_knob(const char *name, const char *def) {
 // render thread, the guest cores, the job workers) never share a core's execution units with another; "ab" switches
 // it with the A/B blocks. Off by default until measured here; Savage Wind Recomp
 // reported +4-10% from the same rule on an 8-core SMT CPU.
+// Affinity is left alone until the rule is first on: the replay and recorder threads may have placed themselves
+// (vk_backend.c vk_render_thread_place), and a mask of every processor applied at the first present undid that.
 static void cpu_placement(void) {
-    static int mode = -1, applied = -1;
+    static int mode = -1, applied = 0;
     static uint64_t all, one;
     if (mode < 0) {
         mode = rt_knob("ONE_PER_CORE", "0");

@@ -198,10 +198,22 @@ static uint64_t submit_sync(const uint64_t *handles, int n) {
     return vk_sync_submit(handles, n);
 }
 
+// The replay and recorder threads feed the GPU, and the frame waits on them. On an AYN Odin 3 (Snapdragon 8 Elite:
+// six cores sharing one L2, two faster cores sharing another) running them on the two fast cores took Lookout Landing
+// at 720p from 50 to 62 fps; the same two threads kept together on two of the six other cores gained nothing.
+// TOTK_RENDER_CPUS: unset finds such a cluster (plat_thread_fast_cluster), 0 leaves placement to the system, a CPU
+// list chooses the CPUs.
+void vk_render_thread_place(const char *who) {
+    char cpus[64];
+    if (plat_thread_fast_cluster(cfg_get("TOTK_RENDER_CPUS"), cpus, sizeof cpus))
+        rt_log("vk: the %s thread runs on CPUs %s (TOTK_RENDER_CPUS=0 leaves it to the system)", who, cpus);
+}
+
 static void replay_main(void *arg) {
     (void)arg;
     perf_replay_thread();
     plat_thread_boost();
+    vk_render_thread_place("replay");
     plat_mutex_lock(&rl);
     for (;;) {
         while (!rq_n) plat_cond_wait(&rcv, &rl);

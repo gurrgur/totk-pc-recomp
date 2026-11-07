@@ -506,6 +506,7 @@ void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg);
 void rdoc_init(void);                     // runtime/rdoc.c: TOTK_RDOC debug capture; before vkCreateInstance
 int rdoc_active(void);
 void rdoc_after_present(uint64_t frame);
+void vk_render_thread_place(const char *who);   // replay and recorder threads: on the fast cluster (vk_backend.c)
 void vk_present_drain(void);               // returns once every queued present was submitted to gfx_queue
 int vk_replay_async(void);                 // TOTK_REPLAY_ASYNC (default 0): submissions replay on the replay thread
 void vk_program_release(const prog_t *p);  // GfxBackend.program_release: vk_pipeline.c; weak no-op in vk_backend.c
