@@ -66,6 +66,9 @@ The SDK context storage accounts for four-byte `wchar_t` on Linux (`ffx_types.h`
 `CreateBackendContextVK` and `CreatePipelineVK` unwind partially created Vulkan objects on failure and reject
 context-capacity overflow. The buffer-memory-requirements lookup tries the Vulkan 1.1 core entry point before its
 KHR alias: a Vulkan 1.3 application need not enable the promoted extension, and its KHR entry point can be null.
+`findMemoryTypeIndex` prefers a device-local type the CPU cannot map, as upstream does, and falls back to a
+host-visible device-local type when there is none: on unified-memory GPUs (Adreno under Turnip) every device-local
+type is host-visible, and upstream failed every texture allocation there.
 The GLSL `rw_luma_history` storage qualifier is corrected from `rgba8` to `rgba16f` to match the component's
 `R16G16B16A16_FLOAT` allocations; mismatched storage formats otherwise produce undefined image values. Shader
 freshness checks include the GPU headers as well as pass entry points.

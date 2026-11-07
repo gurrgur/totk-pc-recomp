@@ -402,13 +402,20 @@ uint32_t findMemoryTypeIndex(VkPhysicalDevice physicalDevice, VkMemoryRequiremen
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
 
     uint32_t bestCandidate = UINT32_MAX;
+    // Unified-memory GPUs (Adreno under Turnip) have no device-local type without HOST_VISIBLE: use the first
+    // host-visible one rather than failing when no invisible type exists.
+    uint32_t visibleCandidate = UINT32_MAX;
+    VkMemoryPropertyFlags visibleProperties = 0;
 
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
         if ((memRequirements.memoryTypeBits & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & requestedProperties)) {
 
             // if just device-local memory is requested, make sure this is the invisible heap to prevent over-subscribing the local heap
-            if (requestedProperties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT && (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            if (requestedProperties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT && (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                if (visibleCandidate == UINT32_MAX)
+                    visibleCandidate = i, visibleProperties = memProperties.memoryTypes[i].propertyFlags;
                 continue;
+            }
 
             bestCandidate = i;
             outProperties = memProperties.memoryTypes[i].propertyFlags;
@@ -419,6 +426,10 @@ uint32_t findMemoryTypeIndex(VkPhysicalDevice physicalDevice, VkMemoryRequiremen
         }
     }
 
+    if (bestCandidate == UINT32_MAX && visibleCandidate != UINT32_MAX) {
+        bestCandidate = visibleCandidate;
+        outProperties = visibleProperties;
+    }
     return bestCandidate;
 }
 
