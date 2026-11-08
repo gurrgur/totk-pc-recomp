@@ -36,8 +36,16 @@
 // over DLSS's picture, so the jittered scene reached the screen and the whole picture shook. So from DLSS's evaluation
 // to the frame's end, draws in passes larger than the light target sample DLSS's output in its place
 // (vk_temporal_swap_img, applied by vk_exec_draw.c tex_info): whichever shader scales, it scales DLSS's picture.
+// While the game's dynamic resolution has lowered the scene (888x496 of a 1112x624 scene, 768x432 of 960x536), the
+// bloom composite, the last scene-size pass with the scene depth, still writes a separate target but the copy back into
+// the light target is left out: a plain copy shader (fs 503e40b80c57ed88 on Turnip) draws that composite into the
+// output-sized target instead. DLSS then reads the light target without the composite and the copy drew the jittered
+// composite over DLSS's picture. So a scene-size target written after the scene ended, with the scene depth, and not
+// copied back into the light target is what DLSS reads, and draws that sample it get DLSS's output in its place.
 static struct {
     VkExecTarget color, depth;   // largest current-frame G-buffer depth and its first light target
+    VkExecTarget post;           // this frame's bloom composite when it was not copied back into the light target
+    int post_ok;
     int armed, done, gbuf;       // this frame: scene armed, resolve succeeded, G-buffer observed
     int ended, up;               // scene ended (jitter over), successful resolve wrote scaled output
     struct Size {                // common work images and optional DLSS feature per render/output size
@@ -984,11 +992,19 @@ void vk_temporal_pass(VkExec *ex) {
         if (D.color.width >= o[0]) evaluate(ex, NULL);   // DLAA in place; else wait for the scaling pass
         return;
     }
+    // the bloom composite (the scene depth attached) into a target of its own, and the copy back into the light target
+    if (ex->pass_ncolor == 1 && c->image && scene_color(c->format) && c->width == D.color.width &&
+        c->height == D.color.height && c->samples <= 1 && !c->is3d) {
+        if (c->image == D.color.image) D.post_ok = 0;
+        else if (z->image && z->image == D.depth.image) D.post = *c, D.post_ok = 1;
+        return;
+    }
     // the game's scaling pass: one colour target of the output size, no depth
     unsigned o[2], s[2];
     res_sizes(o, s);
     if (ex->pass_ncolor == 1 && c->image && !z->image && scene_color(c->format) && c->width > D.color.width &&
         c->width == o[0] && c->height == o[1] && c->samples <= 1 && !c->is3d) {
+        if (D.post_ok) D.color = D.post;   // the composite the copy shader scales, not the light target without it
         evaluate(ex, c);
     }
 }
@@ -1033,12 +1049,12 @@ void vk_temporal_frame(void) {
         rt_log("temporal: %s", on ? "on" : "off");
         D.on = on;
         // either way the next DLAA frame starts a new history from an unjittered frame
-        D.reset = 1, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = 0;
+        D.reset = 1, D.cam_prev_ok = 0, D.jit_ok = D.jit_used = D.armed = D.done = D.gbuf = D.ended = D.up = D.post_ok = 0;
         D.hold = 0;
         return;
     }
     if (!dl_active()) {
-        D.armed = D.done = D.jit_used = D.gbuf = D.ended = D.up = D.ids_ok = 0;
+        D.armed = D.done = D.jit_used = D.gbuf = D.ended = D.up = D.ids_ok = D.post_ok = 0;
         D.cam_addr = 0;
         D.cam_depth = VK_NULL_HANDLE;
         return;
@@ -1047,7 +1063,7 @@ void vk_temporal_frame(void) {
     if (D.jit_used && !D.done) D.hold = 60, D.holds++;   // jittered but not resolved: that frame shook
     else if (D.hold) D.hold--;
     if (!D.done) { D.jit_ok = 0; D.jdepth = VK_NULL_HANDLE; invalidate_history(); }
-    D.armed = D.done = D.jit_used = D.gbuf = D.ended = D.up = D.ids_ok = 0;
+    D.armed = D.done = D.jit_used = D.gbuf = D.ended = D.up = D.ids_ok = D.post_ok = 0;
     D.cam_addr = 0;
     D.camera_valid = 0;
     D.cam_depth = VK_NULL_HANDLE;
